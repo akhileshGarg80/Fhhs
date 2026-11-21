@@ -1,0 +1,6 @@
+{
+  "name": "GramPath — OpenStreetMap Village Road Mapper",
+  "description": "Walk-to-map village paths and rural roads on OpenStreetMap, share routes with everyone in real time, and transfer verified ways directly to OpenStreetMap.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
