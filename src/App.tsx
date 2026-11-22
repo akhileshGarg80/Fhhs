@@ -1,4 +1,5 @@
 import {
+  Bookmark,
   ChevronDown,
   ChevronUp,
   Eye,
@@ -7,11 +8,13 @@ import {
   MapPin,
   Moon,
   Navigation,
+  Plus,
   PlusCircle,
   Route,
   Search,
   Store,
   Sun,
+  Trash2,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -22,7 +25,6 @@ import AutoMapXWorkspace, {
 } from './components/AutoMapXWorkspace.tsx';
 import AutoWorkspace from './components/AutoWorkspace.tsx';
 import NavigationPanel from './components/NavigationPanel.tsx';
-import { OfflineIndicator } from './components/OfflineIndicator.tsx';
 import { PWAInstallButton } from './components/PWAInstallButton.tsx';
 import SavedDataView from './components/SavedDataView.tsx';
 import VillageMap, {
@@ -39,6 +41,7 @@ import type {
   JunctionWayCount,
   LatLngPoint,
   RoadJunction,
+  SavedSearchArea,
   VillageHouse,
   VillageRoad,
 } from './types/map.ts';
@@ -72,8 +75,10 @@ import {
   clearLocalStore,
   loadAutoTrips,
   loadLocalStore,
+  loadSavedAreas,
   saveAutoTrips,
   saveLocalStore,
+  saveSavedAreas,
 } from './utils/storage.ts';
 
 type WorkspaceMode = 'navigate' | 'add' | 'automapx' | 'auto' | 'preview';
@@ -99,16 +104,21 @@ export default function App() {
     }
   }, [theme]);
 
-  // LocalStorage data (roads + left/right houses + independent auto trips)
+  // LocalStorage data (roads + left/right houses + independent auto trips + saved searched areas)
   const initialStore = useMemo(() => loadLocalStore(), []);
   const initialAutoTrips = useMemo(() => loadAutoTrips(), []);
+  const initialSavedAreas = useMemo(() => loadSavedAreas(), []);
   const [roads, setRoads] = useState<VillageRoad[]>(initialStore.roads);
   const [houses, setHouses] = useState<VillageHouse[]>(initialStore.houses);
   const [autoTrips, setAutoTrips] = useState<AutoTrip[]>(initialAutoTrips);
   const [selectedAutoTripId, setSelectedAutoTripId] = useState<string | null>(
     () => initialAutoTrips[0]?.id ?? null
   );
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [savedAreas, setSavedAreas] = useState<SavedSearchArea[]>(initialSavedAreas);
+  const [activeSavedAreaId, setActiveSavedAreaId] = useState<string | null>(
+    () => initialSavedAreas[0]?.id ?? null
+  );
+  const [savedAreasMenuOpen, setSavedAreasMenuOpen] = useState(false);
 
   useEffect(() => {
     saveLocalStore({ roads, houses });
@@ -117,6 +127,10 @@ export default function App() {
   useEffect(() => {
     saveAutoTrips(autoTrips);
   }, [autoTrips]);
+
+  useEffect(() => {
+    saveSavedAreas(savedAreas);
+  }, [savedAreas]);
 
   // Search 1 (Navigate only): Village / Location Search
   const [areaQuery, setAreaQuery] = useState('');
@@ -141,6 +155,7 @@ export default function App() {
     lat: 24.9852,
     lng: 82.0625,
   });
+  const [navStartHouse, setNavStartHouse] = useState<VillageHouse | null>(null);
   const navWatchIdRef = useRef<number | null>(null);
   const lastNavGpsRef = useRef<LatLngPoint | null>(null);
   const lastAddGpsRef = useRef<LatLngPoint | null>(null);
@@ -153,9 +168,9 @@ export default function App() {
   );
 
   const mapViewRef = useRef<{ lat: number; lng: number; zoom: number; bearing?: number }>({
-    lat: 24.986,
-    lng: 82.0633,
-    zoom: 18,
+    lat: initialSavedAreas[0]?.lat ?? 24.986,
+    lng: initialSavedAreas[0]?.lng ?? 82.0633,
+    zoom: initialSavedAreas[0]?.zoom ?? 18,
     bearing: 0,
   });
   const autoFollowGpsRef = useRef(true);
@@ -239,7 +254,9 @@ export default function App() {
   const straightAnchorCountRef = useRef<number>(1);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [gpsError, setGpsError] = useState<string | null>(null);
-  const [detectedVillage, setDetectedVillage] = useState('Koraon Gram');
+  const [detectedVillage, setDetectedVillage] = useState(
+    () => initialSavedAreas[0]?.name ?? 'Koraon Gram'
+  );
   const walkWatchIdRef = useRef<number | null>(null);
   const lastAcceptedWalkTsRef = useRef<number>(0);
   const lastReverseRef = useRef<{ lat: number; lng: number } | null>(null);
@@ -311,15 +328,9 @@ export default function App() {
 
   const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
 
-  const showToast = useCallback((msg: string) => {
-    setToastMessage(msg);
+  const showToast = useCallback((_msg: string) => {
+    // Notifications suppressed so clicks never interrupt the map UX
   }, []);
-
-  useEffect(() => {
-    if (!toastMessage) return;
-    const t = setTimeout(() => setToastMessage(null), 3800);
-    return () => clearTimeout(t);
-  }, [toastMessage]);
 
   useEffect(() => {
     try {
@@ -891,10 +902,10 @@ export default function App() {
       });
   }, [houses, houseQuery]);
 
-  // Compute up to 3 saved-road routes from navOrigin to target House
+  // Compute all distinct saved-road routes from navOrigin to target House
   const navRouteOptions = useMemo(() => {
     if (!targetHouse) return [];
-    return findRoutesToHouse(roads, navOrigin, targetHouse, 3);
+    return findRoutesToHouse(roads, navOrigin, targetHouse, 8);
   }, [targetHouse, roads, navOrigin]);
 
   const safeSelectedRouteIndex =
@@ -924,7 +935,7 @@ export default function App() {
       roads,
       { lat: previewFromHouse.roadLat, lng: previewFromHouse.roadLng },
       previewToHouse,
-      3
+      8
     );
   }, [roads, previewFromHouse, previewToHouse]);
 
@@ -1135,6 +1146,7 @@ export default function App() {
   const startNavigateToHouse = useCallback(
     (house: VillageHouse) => {
       setMode('navigate');
+      setNavStartHouse(null);
       setTargetHouse(house);
       setNavOrigin({ lat: userLocation.lat, lng: userLocation.lng });
       setSelectedRouteIndex(0);
@@ -1152,7 +1164,7 @@ export default function App() {
         handleLocateMe(false);
       }
 
-      const initialRoutes = findRoutesToHouse(roads, userLocation, house, 3);
+      const initialRoutes = findRoutesToHouse(roads, userLocation, house, 8);
       const bestRoute = initialRoutes[0];
       const targetRoad = roads.find((r) => r.id === house.roadId);
       const distToHouse = haversineMeters(userLocation, house);
@@ -1192,8 +1204,61 @@ export default function App() {
     [roads, userLocation, handleLocateMe]
   );
 
+  const handleStartPreviewRouteNavigation = useCallback(
+    (fromHouse: VillageHouse, toHouse: VillageHouse, routeIndex: number) => {
+      const originPt = { lat: fromHouse.roadLat, lng: fromHouse.roadLng };
+      const routes = findRoutesToHouse(roads, originPt, toHouse, 8);
+      const safeIdx = routes.length > 0 ? Math.min(routeIndex, routes.length - 1) : 0;
+      const chosen = routes[safeIdx] ?? routes[0];
+
+      setMode('navigate');
+      setIsLiveGps(false);
+      setIsPickingSpot(false);
+      setHouseDropdownOpen(false);
+      setNavStartHouse(fromHouse);
+      setTargetHouse(toHouse);
+      setNavOrigin(originPt);
+      setUserLocation({ lat: originPt.lat, lng: originPt.lng, accuracy: 2.0, timestamp: Date.now() });
+      setSelectedRouteIndex(safeIdx);
+      setCurrentNavStepIdx(0);
+      simIdxRef.current = 0;
+      lastSpokenRef.current = -1;
+      arrivedHouseIdRef.current = null;
+      setIsSimulatingNav(false);
+      autoFollowGpsRef.current = false;
+      setIsFollowingGps(false);
+
+      if (chosen?.reachable && chosen.polyline.length >= 2) {
+        setFocusTarget({
+          lat: toHouse.lat,
+          lng: toHouse.lng,
+          boundsPoints: [
+            { lat: fromHouse.lat, lng: fromHouse.lng },
+            ...chosen.polyline.map((p) => ({ lat: p.lat, lng: p.lng })),
+            { lat: toHouse.lat, lng: toHouse.lng },
+          ],
+          key: Date.now(),
+        });
+      } else {
+        setFocusTarget({
+          lat: toHouse.lat,
+          lng: toHouse.lng,
+          zoom: 18,
+          key: Date.now(),
+        });
+      }
+      showToast(
+        `Route active: House ${fromHouse.houseNumber} → House ${toHouse.houseNumber}${
+          chosen?.reachable ? ` (${formatDistance(chosen.totalDistanceMeters)})` : ''
+        }`
+      );
+    },
+    [roads, showToast]
+  );
+
   const handleExitNavigation = useCallback(() => {
     setTargetHouse(null);
+    setNavStartHouse(null);
     setIsSimulatingNav(false);
     arrivedHouseIdRef.current = null;
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
@@ -1208,6 +1273,106 @@ export default function App() {
       showToast(`"${houseQuery.trim()}" is not saved yet.`);
     }
   };
+
+  const saveOrActivateArea = useCallback(
+    (input: { name: string; displayName: string; lat: number; lng: number; zoom?: number }) => {
+      const now = new Date().toISOString();
+      const cleanName = input.name.trim() || 'Saved Area';
+      const zoom = input.zoom ?? 17;
+
+      const existingIdx = savedAreas.findIndex(
+        (a) =>
+          a.name.toLowerCase() === cleanName.toLowerCase() ||
+          haversineMeters(a, { lat: input.lat, lng: input.lng }) < 400
+      );
+
+      let nextList: SavedSearchArea[];
+      let nextActiveId: string;
+
+      if (existingIdx >= 0) {
+        const existing = savedAreas[existingIdx];
+        nextActiveId = existing.id;
+        const updated: SavedSearchArea = {
+          ...existing,
+          name: cleanName,
+          displayName: input.displayName,
+          lat: input.lat,
+          lng: input.lng,
+          zoom,
+          lastUsedAt: now,
+        };
+        nextList = [updated, ...savedAreas.filter((_, i) => i !== existingIdx)].slice(0, 12);
+      } else {
+        const created: SavedSearchArea = {
+          id: `area-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: cleanName,
+          displayName: input.displayName,
+          lat: input.lat,
+          lng: input.lng,
+          zoom,
+          savedAt: now,
+          lastUsedAt: now,
+        };
+        nextActiveId = created.id;
+        nextList = [created, ...savedAreas].slice(0, 12);
+      }
+
+      setSavedAreas(nextList);
+      setActiveSavedAreaId(nextActiveId);
+      setDetectedVillage(cleanName);
+    },
+    [savedAreas]
+  );
+
+  const handleJumpToSavedArea = useCallback(
+    (area: SavedSearchArea) => {
+      const now = new Date().toISOString();
+      setSavedAreas((prev) => [
+        { ...area, lastUsedAt: now },
+        ...prev.filter((a) => a.id !== area.id),
+      ]);
+      setActiveSavedAreaId(area.id);
+      setDetectedVillage(area.name);
+      setSavedAreasMenuOpen(false);
+      autoFollowGpsRef.current = false;
+      setIsFollowingGps(false);
+      setFocusTarget({
+        lat: area.lat,
+        lng: area.lng,
+        zoom: area.zoom || 17,
+        key: Date.now(),
+      });
+      showToast(`Jumped to ${area.name}`);
+    },
+    [showToast]
+  );
+
+  const handleSaveCurrentViewArea = useCallback(() => {
+    const view = mapViewRef.current;
+    const label = detectedVillage.trim() || `Area ${view.lat.toFixed(3)}, ${view.lng.toFixed(3)}`;
+    saveOrActivateArea({
+      name: label,
+      displayName: `${label} (${view.lat.toFixed(4)}, ${view.lng.toFixed(4)})`,
+      lat: view.lat,
+      lng: view.lng,
+      zoom: Math.max(15, Math.round(view.zoom || 17)),
+    });
+    setSavedAreasMenuOpen(false);
+    showToast(`Saved "${label}" to quick areas.`);
+  }, [detectedVillage, saveOrActivateArea, showToast]);
+
+  const handleDeleteSavedArea = useCallback(
+    (areaId: string) => {
+      setSavedAreas((prev) => {
+        const next = prev.filter((a) => a.id !== areaId);
+        if (activeSavedAreaId === areaId) {
+          setActiveSavedAreaId(next[0]?.id ?? null);
+        }
+        return next;
+      });
+    },
+    [activeSavedAreaId]
+  );
 
   const handleAreaSearchSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -2909,6 +3074,7 @@ export default function App() {
       interactionMode="browse"
       onMapClick={() => {}}
       onNavigateHouse={startNavigateToHouse}
+      onSelectRouteIndex={setPreviewSelectedRouteIndex}
       onSelectPendingBranch={handleSelectPendingBranch}
       onCenterGps={() => handleLocateMe(true)}
       isFollowingGps={isFollowingGps}
@@ -2997,6 +3163,7 @@ export default function App() {
       routeResult={navRouteResult}
       alternativeRoutes={navRouteOptions}
       liveProgress={mode === 'add' ? null : liveProgress}
+      startHouse={mode === 'add' ? null : navStartHouse}
       targetHouse={mode === 'add' ? null : targetHouse}
       darkMode={theme === 'dark'}
       isolateNavigation={isolateNavigation}
@@ -3005,6 +3172,12 @@ export default function App() {
       interactionMode={interactionMode}
       onMapClick={handleMapClick}
       onNavigateHouse={startNavigateToHouse}
+      onSelectRouteIndex={(idx) => {
+        setSelectedRouteIndex(idx);
+        setCurrentNavStepIdx(0);
+        simIdxRef.current = 0;
+        setIsSimulatingNav(false);
+      }}
       onSelectPendingBranch={handleSelectPendingBranch}
       onExitNavigation={handleExitNavigation}
       onCenterGps={() => handleLocateMe(true)}
@@ -3096,17 +3269,143 @@ export default function App() {
 
   return (
     <div className="h-[100dvh] w-screen flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
-      {/* Clean Minimal Top Header — Primary Workspace Tabs live in the Bottom Nav */}
-      <header className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-3 sm:px-5 h-11 flex items-center justify-between gap-2 z-40">
-        <div className="flex items-center gap-2 min-w-0">
+      {/* Clean Top Header — GramPath + Saved Searched Areas Bar */}
+      <header className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-3 sm:px-5 h-11 flex items-center justify-between gap-2 z-[520] relative">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-sm sm:text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
             GramPath
           </span>
+
+          {/* Saved Searched Areas beside GramPath so users don't repeat area search next visit */}
+          <div className="relative flex items-center gap-1 min-w-0">
+            <button
+              type="button"
+              onClick={() => setSavedAreasMenuOpen((v) => !v)}
+              title="Saved Areas (click to switch or pin current area)"
+              className={`h-7 px-2 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors max-w-[140px] sm:max-w-[180px] ${
+                savedAreas.length > 0
+                  ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
+                  : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+              }`}
+            >
+              <Bookmark className="w-3 h-3 shrink-0" />
+              <span className="truncate">
+                {savedAreas.find((a) => a.id === activeSavedAreaId)?.name ??
+                  savedAreas[0]?.name ??
+                  'Saved Areas'}
+              </span>
+              {savedAreas.length > 0 && (
+                <span className="px-1 rounded bg-emerald-700 text-white text-[9px] font-mono tabular-nums shrink-0">
+                  {savedAreas.length}
+                </span>
+              )}
+              <ChevronDown className="w-3 h-3 shrink-0 opacity-70" />
+            </button>
+
+            {/* Quick 1-tap area buttons in empty desktop header space */}
+            <div className="hidden md:flex items-center gap-1 min-w-0 overflow-hidden">
+              {savedAreas.slice(0, 3).map((area) => {
+                const isActive = area.id === activeSavedAreaId;
+                return (
+                  <button
+                    key={area.id}
+                    type="button"
+                    onClick={() => handleJumpToSavedArea(area)}
+                    title={area.displayName}
+                    className={`h-7 px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 max-w-[130px] cursor-pointer transition-colors shrink-0 ${
+                      isActive
+                        ? 'bg-slate-900 dark:bg-sky-700 text-white border-slate-900 dark:border-sky-700'
+                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    <MapPin className="w-3 h-3 shrink-0 opacity-80" />
+                    <span className="truncate">{area.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {savedAreasMenuOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setSavedAreasMenuOpen(false)}
+                />
+                <div className="absolute left-0 top-8 w-64 sm:w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl z-50 overflow-hidden">
+                  <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 bg-slate-50/70 dark:bg-slate-800/60">
+                    <span className="text-[11px] font-bold text-slate-800 dark:text-slate-200">
+                      Saved Areas ({savedAreas.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleSaveCurrentViewArea}
+                      className="px-2 py-0.5 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Save Current
+                    </button>
+                  </div>
+                  {savedAreas.length === 0 ? (
+                    <div className="px-3 py-3 text-[11px] text-slate-500 dark:text-slate-400">
+                      Search any village/area in Navigate or tap &ldquo;Save Current&rdquo; to pin it here for next time.
+                    </div>
+                  ) : (
+                    <div className="max-h-60 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+                      {savedAreas.map((area) => {
+                        const isActive = area.id === activeSavedAreaId;
+                        return (
+                          <div
+                            key={area.id}
+                            className={`flex items-center justify-between gap-2 px-2.5 py-2 ${
+                              isActive
+                                ? 'bg-emerald-50/80 dark:bg-emerald-950/50'
+                                : 'hover:bg-slate-50 dark:hover:bg-slate-800/70'
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => handleJumpToSavedArea(area)}
+                              className="flex-1 min-w-0 text-left flex items-start gap-2 cursor-pointer"
+                            >
+                              <MapPin
+                                className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
+                                  isActive
+                                    ? 'text-emerald-700 dark:text-emerald-400'
+                                    : 'text-slate-400'
+                                }`}
+                              />
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                  {area.name}
+                                </div>
+                                <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                                  {area.displayName}
+                                </div>
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteSavedArea(area.id)}
+                              aria-label={`Remove ${area.name}`}
+                              className="p-1 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded cursor-pointer shrink-0"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
           {amxIsRunning && mode !== 'automapx' && (
             <button
               type="button"
               onClick={() => setMode('automapx')}
-              className="px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-950/70 text-violet-800 dark:text-violet-300 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+              className="px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-950/70 text-violet-800 dark:text-violet-300 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
@@ -3120,7 +3419,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setMode('auto')}
-              className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+              className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
             >
               <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
               <span>Auto Live</span>
@@ -3163,6 +3462,7 @@ export default function App() {
               routeOptions={previewRouteOptions}
               selectedRouteIndex={previewSafeRouteIdx}
               onSelectRouteIndex={setPreviewSelectedRouteIndex}
+              onStartRouteNavigation={handleStartPreviewRouteNavigation}
               onNavigateHouse={startNavigateToHouse}
               onMapPendingBranch={handleSelectPendingBranch}
               onFocusRoad={(road) => {
@@ -3453,16 +3753,26 @@ export default function App() {
                           key={item.place_id}
                           type="button"
                           onClick={() => {
+                            const lat = Number(item.lat);
+                            const lng = Number(item.lon);
+                            const shortName = item.display_name.split(',')[0]?.trim() || 'My Village';
+                            autoFollowGpsRef.current = false;
+                            setIsFollowingGps(false);
                             setFocusTarget({
-                              lat: Number(item.lat),
-                              lng: Number(item.lon),
+                              lat,
+                              lng,
                               zoom: 17,
                               key: Date.now(),
                             });
-                            setDetectedVillage(
-                              item.display_name.split(',')[0]?.trim() || 'My Village'
-                            );
+                            saveOrActivateArea({
+                              name: shortName,
+                              displayName: item.display_name,
+                              lat,
+                              lng,
+                              zoom: 17,
+                            });
                             setAreaResults([]);
+                            showToast(`Saved "${shortName}" to header areas.`);
                           }}
                           className="w-full px-3 py-2 text-left text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-start gap-2 cursor-pointer"
                         >
@@ -3621,21 +3931,6 @@ export default function App() {
             </div>
           </>
         )}
-
-        {toastMessage && (
-          <div className="fixed bottom-16 right-4 z-[1100] max-w-xs sm:max-w-sm bg-slate-900 dark:bg-slate-800 text-white border border-slate-800 dark:border-slate-700 text-xs font-medium px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-3">
-            <span>{toastMessage}</span>
-            <button
-              type="button"
-              onClick={() => setToastMessage(null)}
-              className="text-slate-400 hover:text-white cursor-pointer"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
-
-        <OfflineIndicator />
       </main>
 
       {/* Persistent Thumb-Zone Bottom Navigation Bar with AutoMapX */}

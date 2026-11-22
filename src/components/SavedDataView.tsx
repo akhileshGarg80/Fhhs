@@ -15,7 +15,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { type ReactNode, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import type { RoadJunction, VillageHouse, VillageRoad, VillageRouteResult } from '../types/map.ts';
 import { formatDistance, generateGpxExport, getSurfaceLabel } from '../utils/geo.ts';
 import { TurnIcon } from './NavigationPanel.tsx';
@@ -31,6 +31,11 @@ interface SavedDataViewProps {
   routeOptions: VillageRouteResult[];
   selectedRouteIndex: number;
   onSelectRouteIndex: (index: number) => void;
+  onStartRouteNavigation?: (
+    fromHouse: VillageHouse,
+    toHouse: VillageHouse,
+    routeIndex: number
+  ) => void;
   onNavigateHouse: (house: VillageHouse) => void;
   onFocusRoad: (road: VillageRoad) => void;
   onFocusHouse: (house: VillageHouse) => void;
@@ -40,6 +45,219 @@ interface SavedDataViewProps {
   onDeleteRoad: (roadId: string) => void;
   onImportBackup: (data: { roads: VillageRoad[]; houses: VillageHouse[] }) => void;
   onClearAll: () => void;
+}
+
+function formatHouseLabel(h: VillageHouse): string {
+  return `House ${h.houseNumber}${h.shopName ? ` · ${h.shopName}` : ''} (${h.roadName})`;
+}
+
+interface HousePointInputProps {
+  badge: 'A' | 'B';
+  placeholder: string;
+  houses: VillageHouse[];
+  selectedHouseId: string | null;
+  otherHouseId: string | null;
+  onSelect: (houseId: string | null) => void;
+}
+
+function HousePointInput({
+  badge,
+  placeholder,
+  houses,
+  selectedHouseId,
+  otherHouseId,
+  onSelect,
+}: HousePointInputProps) {
+  const selectedHouse = useMemo(
+    () => (selectedHouseId ? houses.find((h) => h.id === selectedHouseId) ?? null : null),
+    [houses, selectedHouseId]
+  );
+  const [focused, setFocused] = useState(false);
+  const [text, setText] = useState(() => (selectedHouse ? formatHouseLabel(selectedHouse) : ''));
+
+  useEffect(() => {
+    if (!focused) {
+      setText(selectedHouse ? formatHouseLabel(selectedHouse) : '');
+    }
+  }, [selectedHouse, focused]);
+
+  const matches = useMemo(() => {
+    const q = text.trim().toLowerCase();
+    const list = !q
+      ? houses
+      : houses.filter((h) => {
+          const num = h.houseNumber.toLowerCase();
+          const shop = (h.shopName ?? '').toLowerCase();
+          const road = h.roadName.toLowerCase();
+          return num.includes(q) || shop.includes(q) || road.includes(q) || `house ${num}`.includes(q);
+        });
+    return [...list].sort((a, b) => {
+      const aq = q.replace(/^house\s+/i, '');
+      const aNum = a.houseNumber.toLowerCase();
+      const bNum = b.houseNumber.toLowerCase();
+      const aScore = aNum === aq ? 0 : aNum.startsWith(aq) ? 1 : (a.shopName ?? '').toLowerCase().startsWith(aq) ? 2 : 3;
+      const bScore = bNum === aq ? 0 : bNum.startsWith(aq) ? 1 : (b.shopName ?? '').toLowerCase().startsWith(aq) ? 2 : 3;
+      return aScore - bScore;
+    });
+  }, [houses, text]);
+
+  const badgeBg = badge === 'A' ? 'bg-sky-600' : 'bg-red-600';
+  const focusRing = badge === 'A' ? 'focus-within:ring-sky-500' : 'focus-within:ring-red-500';
+
+  const commitTopMatch = () => {
+    const q = text.trim().toLowerCase().replace(/^house\s+/i, '');
+    if (!q) {
+      onSelect(null);
+      return;
+    }
+    const exact = matches.find((h) => h.houseNumber.toLowerCase() === q);
+    const chosen = exact ?? matches[0] ?? null;
+    if (chosen) {
+      onSelect(chosen.id);
+      setText(formatHouseLabel(chosen));
+      setFocused(false);
+    }
+  };
+
+  return (
+    <div className="relative flex items-center gap-2 min-w-0">
+      <span
+        className={`w-6 h-6 rounded-md ${badgeBg} text-white text-xs font-bold flex items-center justify-center shrink-0`}
+      >
+        {badge}
+      </span>
+      <div
+        className={`flex-1 min-w-0 flex items-center h-9 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden focus-within:ring-2 ${focusRing}`}
+      >
+        <input
+          type="text"
+          value={text}
+          placeholder={placeholder}
+          aria-label={placeholder}
+          onFocus={() => {
+            setFocused(true);
+            if (selectedHouse) {
+              setText(selectedHouse.houseNumber);
+            }
+          }}
+          onBlur={() => {
+            setTimeout(() => {
+              const q = text.trim().toLowerCase().replace(/^house\s+/i, '');
+              if (q) {
+                const exact = houses.find((h) => h.houseNumber.toLowerCase() === q);
+                if (exact && exact.id !== selectedHouseId) {
+                  onSelect(exact.id);
+                }
+              }
+              setFocused(false);
+            }, 160);
+          }}
+          onChange={(e) => {
+            const val = e.target.value;
+            setText(val);
+            setFocused(true);
+            const q = val.trim().toLowerCase().replace(/^house\s+/i, '');
+            if (!q) {
+              onSelect(null);
+              return;
+            }
+            const exactMatches = houses.filter((h) => h.houseNumber.toLowerCase() === q);
+            const prefixMatches = houses.filter(
+              (h) => h.houseNumber.toLowerCase().startsWith(q) && h.houseNumber.toLowerCase() !== q
+            );
+            if (exactMatches.length === 1 && prefixMatches.length === 0) {
+              onSelect(exactMatches[0].id);
+            }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              commitTopMatch();
+            } else if (e.key === 'Escape') {
+              setFocused(false);
+            }
+          }}
+          className="flex-1 min-w-0 px-2.5 py-1.5 text-xs font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 bg-transparent focus:outline-none"
+        />
+        {(text || selectedHouseId) && (
+          <button
+            type="button"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              setText('');
+              onSelect(null);
+              setFocused(true);
+            }}
+            aria-label={`Clear point ${badge}`}
+            className="p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer shrink-0"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
+        <button
+          type="button"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setFocused((v) => !v);
+          }}
+          aria-label={`Browse houses for point ${badge}`}
+          className="px-2 h-full border-l border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer shrink-0"
+        >
+          <ChevronDown className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {focused && (
+        <div className="absolute left-8 right-0 top-10 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl divide-y divide-slate-100 dark:divide-slate-800 max-h-56 overflow-y-auto z-50">
+          {matches.length === 0 ? (
+            <div className="px-3 py-2.5 text-xs text-slate-500 dark:text-slate-400">
+              No house or shop matches &ldquo;{text}&rdquo;.
+            </div>
+          ) : (
+            matches.slice(0, 30).map((h) => {
+              const isSelected = h.id === selectedHouseId;
+              const isOther = h.id === otherHouseId;
+              return (
+                <button
+                  key={h.id}
+                  type="button"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onSelect(h.id);
+                    setText(formatHouseLabel(h));
+                    setFocused(false);
+                  }}
+                  className={`w-full px-3 py-2 text-left text-xs flex items-center justify-between gap-2 cursor-pointer ${
+                    isSelected
+                      ? 'bg-sky-50 dark:bg-sky-950/60 font-semibold'
+                      : 'hover:bg-slate-50 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  <div className="min-w-0 truncate">
+                    <span className="font-bold text-slate-900 dark:text-slate-100 font-mono">
+                      #{h.houseNumber}
+                    </span>
+                    {h.shopName && (
+                      <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                        {' '}
+                        · {h.shopName}
+                      </span>
+                    )}
+                    <span className="text-slate-500 dark:text-slate-400"> · {h.roadName}</span>
+                  </div>
+                  {isOther && (
+                    <span className="text-[10px] font-semibold text-amber-700 dark:text-amber-300 shrink-0">
+                      Other pt
+                    </span>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function downloadFile(filename: string, content: string, mime: string) {
@@ -65,6 +283,7 @@ export default function SavedDataView({
   routeOptions,
   selectedRouteIndex,
   onSelectRouteIndex,
+  onStartRouteNavigation,
   onNavigateHouse,
   onFocusRoad,
   onFocusHouse,
@@ -260,25 +479,14 @@ export default function SavedDataView({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_1fr] items-center gap-2">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="w-6 h-6 rounded-md bg-sky-600 text-white text-xs font-bold flex items-center justify-center shrink-0">
-                A
-              </span>
-              <select
-                value={fromHouseId ?? ''}
-                onChange={(e) => onSelectFromHouse(e.target.value || null)}
-                aria-label="Select start point A"
-                className="flex-1 min-w-0 h-9 px-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs font-medium text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
-              >
-                <option value="">Select Start Point (A)...</option>
-                {houses.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    House {h.houseNumber}
-                    {h.shopName ? ` · ${h.shopName}` : ''} ({h.roadName})
-                  </option>
-                ))}
-              </select>
-            </div>
+            <HousePointInput
+              badge="A"
+              placeholder="Type House # or Shop (Start A)..."
+              houses={houses}
+              selectedHouseId={fromHouseId}
+              otherHouseId={toHouseId}
+              onSelect={onSelectFromHouse}
+            />
 
             <button
               type="button"
@@ -291,25 +499,14 @@ export default function SavedDataView({
               <ArrowLeftRight className="w-3.5 h-3.5" />
             </button>
 
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="w-6 h-6 rounded-md bg-red-600 text-white text-xs font-bold flex items-center justify-center shrink-0">
-                B
-              </span>
-              <select
-                value={toHouseId ?? ''}
-                onChange={(e) => onSelectToHouse(e.target.value || null)}
-                aria-label="Select destination point B"
-                className="flex-1 min-w-0 h-9 px-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs font-medium text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-red-500"
-              >
-                <option value="">Select Destination Point (B)...</option>
-                {houses.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    House {h.houseNumber}
-                    {h.shopName ? ` · ${h.shopName}` : ''} ({h.roadName})
-                  </option>
-                ))}
-              </select>
-            </div>
+            <HousePointInput
+              badge="B"
+              placeholder="Type House # or Shop (Dest B)..."
+              houses={houses}
+              selectedHouseId={toHouseId}
+              otherHouseId={fromHouseId}
+              onSelect={onSelectToHouse}
+            />
           </div>
 
           {bothSelected && fromHouseId === toHouseId && (
@@ -319,15 +516,18 @@ export default function SavedDataView({
           )}
 
           {bothSelected && fromHouseId !== toHouseId && activeRoute && (
-            <div className="space-y-2 pt-1">
+            <div className="space-y-2.5 pt-1">
               {!activeRoute.reachable ? (
                 <div className="text-xs text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-lg px-3 py-2">
                   {activeRoute.reason ?? 'No connected road path found between these 2 points yet.'}
                 </div>
               ) : (
-                <div className="bg-sky-50/70 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 rounded-xl p-3 space-y-2">
+                <div className="bg-sky-50/70 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 rounded-xl p-3 space-y-2.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-3 text-xs">
+                    <div className="flex flex-wrap items-center gap-2.5 text-xs">
+                      <span className="px-2 py-0.5 rounded-md bg-slate-900 dark:bg-slate-800 text-white text-[11px] font-bold">
+                        {routeOptions.length} {routeOptions.length === 1 ? 'Route' : 'Routes'} Found
+                      </span>
                       <span className="font-mono tabular-nums font-bold text-slate-900 dark:text-white text-sm">
                         {formatDistance(activeRoute.totalDistanceMeters)}
                       </span>
@@ -346,41 +546,89 @@ export default function SavedDataView({
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => setShowSteps((v) => !v)}
-                      className="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-800 dark:text-slate-200 inline-flex items-center gap-1 cursor-pointer"
-                    >
-                      <span>{activeRoute.instructions.length} Steps</span>
-                      {showSteps ? (
-                        <ChevronUp className="w-3.5 h-3.5" />
-                      ) : (
-                        <ChevronDown className="w-3.5 h-3.5" />
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setShowSteps((v) => !v)}
+                        className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-800 dark:text-slate-200 inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <span>{activeRoute.instructions.length} Steps</span>
+                        {showSteps ? (
+                          <ChevronUp className="w-3.5 h-3.5" />
+                        ) : (
+                          <ChevronDown className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+
+                      {onStartRouteNavigation && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const fromH = houses.find((h) => h.id === fromHouseId);
+                            const toH = houses.find((h) => h.id === toHouseId);
+                            if (fromH && toH) {
+                              onStartRouteNavigation(fromH, toH, selectedRouteIndex);
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-bold inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+                        >
+                          <Navigation className="w-3.5 h-3.5" />
+                          <span>Go This Route</span>
+                        </button>
                       )}
-                    </button>
+                    </div>
                   </div>
 
-                  {routeOptions.length > 1 && (
-                    <div className="flex flex-wrap gap-1.5">
-                      {routeOptions.map((opt, idx) => (
+                  {/* All Available Routes (Shortest highlighted first, plus every alternative clearly selectable) */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {routeOptions.map((opt, idx) => {
+                      const isSelected = idx === selectedRouteIndex;
+                      const shortestDist = routeOptions[0]?.totalDistanceMeters ?? opt.totalDistanceMeters;
+                      const extraM = Math.max(0, opt.totalDistanceMeters - shortestDist);
+                      return (
                         <button
                           key={idx}
                           type="button"
                           onClick={() => onSelectRouteIndex(idx)}
-                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border cursor-pointer ${
-                            idx === selectedRouteIndex
-                              ? 'bg-sky-700 text-white border-sky-700'
-                              : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
+                          className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
+                            isSelected
+                              ? 'bg-sky-700 text-white border-sky-700 shadow-sm'
+                              : 'bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 border-slate-200 dark:border-slate-700 hover:border-sky-400 dark:hover:border-sky-600'
                           }`}
                         >
-                          {opt.routeLabel ?? `Route ${idx + 1}`} ·{' '}
-                          <span className="font-mono tabular-nums">
-                            {formatDistance(opt.totalDistanceMeters)}
-                          </span>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold inline-flex items-center gap-1.5">
+                              <span>{idx === 0 ? 'Shortest (Closest)' : opt.routeLabel ?? `Route ${idx + 1}`}</span>
+                              {idx === 0 && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                    isSelected
+                                      ? 'bg-emerald-500 text-white'
+                                      : 'bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-300'
+                                  }`}
+                                >
+                                  Nearest
+                                </span>
+                              )}
+                            </span>
+                            <span className="font-mono tabular-nums text-xs font-bold">
+                              {formatDistance(opt.totalDistanceMeters)}
+                            </span>
+                          </div>
+                          <div
+                            className={`text-[11px] mt-1 flex items-center justify-between gap-2 ${
+                              isSelected ? 'text-sky-100' : 'text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            <span className="truncate">{opt.viaSummary ?? 'Saved road'}</span>
+                            <span className="font-mono tabular-nums shrink-0">
+                              {extraM > 0 ? `+${formatDistance(extraM)}` : `${opt.walkMinutes}m walk`}
+                            </span>
+                          </div>
                         </button>
-                      ))}
-                    </div>
-                  )}
+                      );
+                    })}
+                  </div>
 
                   {showSteps && activeRoute.instructions.length > 0 && (
                     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg divide-y divide-slate-200 dark:divide-slate-800 max-h-48 overflow-y-auto">
@@ -416,11 +664,15 @@ export default function SavedDataView({
           <div className="px-3.5 py-2 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2 bg-slate-50/70 dark:bg-slate-900/90">
             <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
               {bothSelected && fromHouseId !== toHouseId && activeRoute?.reachable
-                ? 'Showing Route Between Point A & Point B'
+                ? `Showing ${routeOptions.length} ${
+                    routeOptions.length === 1 ? 'Route' : 'Routes'
+                  } Between Point A & Point B`
                 : 'Saved Map Preview (All Roads, Turns, Junctions & Houses)'}
             </span>
             <span className="text-[11px] text-slate-500 dark:text-slate-400 hidden sm:inline">
-              Tap A / B below to test routes between any 2 houses
+              {bothSelected && fromHouseId !== toHouseId && activeRoute?.reachable
+                ? 'Tap any route line on the map or a card above to pick your path'
+                : 'Type numbers above or tap A / B below to compare routes'}
             </span>
           </div>
           <div className="h-[340px] sm:h-[420px] lg:h-[500px] w-full relative">{mapSlot}</div>

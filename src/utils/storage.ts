@@ -1,8 +1,9 @@
-import type { AutoTrip, VillageHouse, VillageRoad } from '../types/map.ts';
+import type { AutoTrip, SavedSearchArea, VillageHouse, VillageRoad } from '../types/map.ts';
 import { calculateBearing, offsetCoord } from './geo.ts';
 
 const STORAGE_KEY = 'grampath_house_mapper_v2';
 const AUTO_TRIPS_KEY = 'grampath_auto_trips_v1';
+const SAVED_AREAS_KEY = 'grampath_saved_areas_v1';
 
 export interface LocalHouseStore {
   roads: VillageRoad[];
@@ -157,3 +158,23 @@ export function saveAutoTrips(trips: AutoTrip[]): void {
     // ignore quota errors
   }
 }
+
+export function loadSavedAreas(): SavedSearchArea[] {
+  try {
+    const raw = localStorage.getItem(SAVED_AREAS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as SavedSearchArea[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveSavedAreas(areas: SavedSearchArea[]): void {
+  try {
+    localStorage.setItem(SAVED_AREAS_KEY, JSON.stringify(areas));
+  } catch {
+    // ignore quota errors
+  }
+}
+

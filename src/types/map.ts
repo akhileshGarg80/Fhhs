@@ -84,6 +84,7 @@ export interface NavigationInstruction {
   instruction: string;
   roadName: string;
   distanceMeters: number;
+  cumDistanceMeters?: number;
   anchorPoint: { lat: number; lng: number };
 }
 
@@ -119,3 +120,15 @@ export interface AutoMapXNode extends LatLngPoint {
   speedMps: number;
   momentLabel?: string;
 }
+
+export interface SavedSearchArea {
+  id: string;
+  name: string;
+  displayName: string;
+  lat: number;
+  lng: number;
+  zoom: number;
+  savedAt: string;
+  lastUsedAt: string;
+}
+

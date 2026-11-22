@@ -213,7 +213,12 @@ export default function NavigationPanel({
             </div>
           ) : (
             <>
-              {activeInstruction && (
+              {activeInstruction && (() => {
+                const upcoming =
+                  activeInstruction.turnType !== 'arrive' && liveProgress?.nextInstruction
+                    ? liveProgress.nextInstruction
+                    : null;
+                return (
                 <div
                   className={`p-4 rounded-xl text-white space-y-2 ${
                     isArrived ? 'bg-emerald-700' : 'bg-slate-900'
@@ -221,7 +226,10 @@ export default function NavigationPanel({
                 >
                   <div className="flex items-start gap-3">
                     <div className="w-10 h-10 rounded-lg bg-white/15 flex items-center justify-center shrink-0">
-                      <TurnIcon turn={activeInstruction.turnType} className="w-6 h-6 text-white" />
+                      <TurnIcon
+                        turn={upcoming ? upcoming.turnType : activeInstruction.turnType}
+                        className="w-6 h-6 text-white"
+                      />
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="text-xs font-mono tabular-nums text-emerald-300">
@@ -232,8 +240,13 @@ export default function NavigationPanel({
                           : formatDistance(activeInstruction.distanceMeters)}
                       </div>
                       <div className="text-base font-bold leading-snug">
-                        {activeInstruction.instruction}
+                        {upcoming ? upcoming.instruction : activeInstruction.instruction}
                       </div>
+                      {upcoming && (
+                        <div className="text-[11px] text-slate-300 mt-0.5 truncate">
+                          Now: {activeInstruction.instruction}
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -273,7 +286,8 @@ export default function NavigationPanel({
                     </div>
                   )}
                 </div>
-              )}
+                );
+              })()}
 
               {/* Available Routes Comparison when multiple village road paths exist */}
               {routeOptions.length > 1 && (

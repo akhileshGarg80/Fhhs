@@ -80,33 +80,36 @@ export function offsetCoord(
 
 export function getTurnDirection(prevBearing: number, nextBearing: number): TurnDirection {
   const delta = ((nextBearing - prevBearing + 540) % 360) - 180;
-  if (Math.abs(delta) < 22) return 'straight';
-  if (delta >= 22 && delta < 65) return 'slight_right';
-  if (delta >= 65 && delta < 125) return 'right';
-  if (delta >= 125) return 'sharp_right';
-  if (delta <= -22 && delta > -65) return 'slight_left';
-  if (delta <= -65 && delta > -125) return 'left';
-  return 'sharp_left';
+  const abs = Math.abs(delta);
+  if (abs < 28) return 'straight';
+  if (abs < 58) return delta > 0 ? 'slight_right' : 'slight_left';
+  if (abs < 125) return delta > 0 ? 'right' : 'left';
+  return delta > 0 ? 'sharp_right' : 'sharp_left';
 }
 
-export function formatTurnAction(turn: TurnDirection, roadName: string): string {
+export function formatTurnAction(
+  turn: TurnDirection,
+  roadName: string,
+  sameRoad = false
+): string {
+  const prep = sameRoad ? 'along' : 'onto';
   switch (turn) {
     case 'depart':
-      return `Head onto ${roadName}`;
+      return `Go straight on ${roadName}`;
     case 'straight':
       return `Continue straight onto ${roadName}`;
     case 'slight_left':
-      return `Keep left onto ${roadName}`;
+      return `Curve left ${prep} ${roadName}`;
     case 'left':
-      return `Turn left onto ${roadName}`;
+      return `Turn left ${prep} ${roadName}`;
     case 'sharp_left':
-      return `Sharp left onto ${roadName}`;
+      return `Sharp left ${prep} ${roadName}`;
     case 'slight_right':
-      return `Keep right onto ${roadName}`;
+      return `Curve right ${prep} ${roadName}`;
     case 'right':
-      return `Turn right onto ${roadName}`;
+      return `Turn right ${prep} ${roadName}`;
     case 'sharp_right':
-      return `Sharp right onto ${roadName}`;
+      return `Sharp right ${prep} ${roadName}`;
     case 'arrive':
       return `Arrive at ${roadName}`;
   }
@@ -622,6 +625,47 @@ function runDijkstra(
   return { nodeSeq, edgeSeq, trueDistMeters: trueDist[endNode] };
 }
 
+function pointAlongCleanedBack(
+  pts: { lat: number; lng: number }[],
+  cum: number[],
+  idx: number,
+  windowMeters: number
+): { lat: number; lng: number } {
+  const target = Math.max(0, cum[idx] - windowMeters);
+  let i = idx;
+  while (i > 0 && cum[i - 1] > target) {
+    i--;
+  }
+  if (i === 0) return pts[0];
+  const segLen = Math.max(0.01, cum[i] - cum[i - 1]);
+  const t = Math.max(0, Math.min(1, (target - cum[i - 1]) / segLen));
+  return {
+    lat: pts[i - 1].lat + (pts[i].lat - pts[i - 1].lat) * t,
+    lng: pts[i - 1].lng + (pts[i].lng - pts[i - 1].lng) * t,
+  };
+}
+
+function pointAlongCleanedAhead(
+  pts: { lat: number; lng: number }[],
+  cum: number[],
+  idx: number,
+  windowMeters: number
+): { lat: number; lng: number } {
+  const maxCum = cum[cum.length - 1] ?? 0;
+  const target = Math.min(maxCum, cum[idx] + windowMeters);
+  let i = idx;
+  while (i < pts.length - 2 && cum[i + 1] < target) {
+    i++;
+  }
+  if (i >= pts.length - 1) return pts[pts.length - 1];
+  const segLen = Math.max(0.01, cum[i + 1] - cum[i]);
+  const t = Math.max(0, Math.min(1, (target - cum[i]) / segLen));
+  return {
+    lat: pts[i].lat + (pts[i + 1].lat - pts[i].lat) * t,
+    lng: pts[i].lng + (pts[i + 1].lng - pts[i].lng) * t,
+  };
+}
+
 function buildRouteResultFromPath(
   nodes: GraphNode[],
   nodeSeq: number[],
@@ -644,58 +688,154 @@ function buildRouteResultFromPath(
     }
   }
 
+  const fullPolyline = [...polyline];
+  if (startApproachMeters > 5) {
+    fullPolyline.unshift({ lat: userStart.lat, lng: userStart.lng });
+  }
+
+  const fullPolyCum: number[] = [0];
+  for (let i = 1; i < fullPolyline.length; i++) {
+    fullPolyCum.push(fullPolyCum[i - 1] + haversineMeters(fullPolyline[i - 1], fullPolyline[i]));
+  }
+  const totalPolyMeters = fullPolyCum[fullPolyCum.length - 1] ?? 0;
+
   const instructions: NavigationInstruction[] = [];
   if (edgeSeq.length >= 1) {
-    let activeRoadName = edgeSeq[0].roadName;
-    let segmentDist = 0;
-    let segmentStartPt = polyline[0];
-    let lastTurnType: TurnDirection = 'depart';
+    // Stage 1: Group consecutive edges by contiguous roadId/roadName and smooth minor ±4.5m wobbles
+    // so slightly zigzaggy straight paths are treated as clean straight lines while keeping junctions & real curves.
+    const runs: {
+      roadId: string;
+      roadName: string;
+      pts: { lat: number; lng: number }[];
+    }[] = [];
 
     for (let i = 0; i < edgeSeq.length; i++) {
-      const edge = edgeSeq[i];
+      const e = edgeSeq[i];
       const p1 = polyline[i];
       const p2 = polyline[i + 1];
-      const stepMeters = haversineMeters(p1, p2);
-
-      if (i === 0) {
-        activeRoadName = edge.roadName;
-        segmentDist = stepMeters;
-        segmentStartPt = p1;
-        lastTurnType = 'depart';
+      const lastRun = runs[runs.length - 1];
+      if (lastRun && lastRun.roadId === e.roadId && lastRun.roadName === e.roadName) {
+        lastRun.pts.push(p2);
       } else {
-        const prevBearing = calculateBearing(polyline[i - 1], p1);
-        const currBearing = calculateBearing(p1, p2);
-        const turn = getTurnDirection(prevBearing, currBearing);
-        const roadChanged = edge.roadName !== activeRoadName;
-        const significantTurn = turn !== 'straight';
+        runs.push({
+          roadId: e.roadId,
+          roadName: e.roadName,
+          pts: [p1, p2],
+        });
+      }
+    }
 
-        if (roadChanged || significantTurn) {
-          instructions.push({
-            id: `inst-${routeIndex}-${instructions.length}`,
-            turnType: lastTurnType,
-            instruction: formatTurnAction(lastTurnType, activeRoadName),
-            roadName: activeRoadName,
-            distanceMeters: Math.round(segmentDist),
-            anchorPoint: segmentStartPt,
-          });
-          activeRoadName = edge.roadName;
-          segmentDist = stepMeters;
-          segmentStartPt = p1;
-          lastTurnType = turn === 'straight' ? 'straight' : turn;
-        } else {
-          segmentDist += stepMeters;
+    const cleanedPts: { lat: number; lng: number }[] = [];
+    const cleanedSegMeta: { roadId: string; roadName: string }[] = [];
+
+    for (let r = 0; r < runs.length; r++) {
+      const run = runs[r];
+      const simplified = simplifyPath(run.pts, 4.5);
+      for (let k = 0; k < simplified.length; k++) {
+        if (k === 0 && cleanedPts.length > 0) continue;
+        cleanedPts.push(simplified[k]);
+        if (cleanedPts.length > 1) {
+          cleanedSegMeta.push({ roadId: run.roadId, roadName: run.roadName });
         }
       }
     }
 
-    instructions.push({
-      id: `inst-${routeIndex}-${instructions.length}`,
-      turnType: lastTurnType,
-      instruction: formatTurnAction(lastTurnType, activeRoadName),
-      roadName: activeRoadName,
-      distanceMeters: Math.round(segmentDist),
-      anchorPoint: segmentStartPt,
-    });
+    const cleanedCum: number[] = [0];
+    for (let i = 1; i < cleanedPts.length; i++) {
+      cleanedCum.push(cleanedCum[i - 1] + haversineMeters(cleanedPts[i - 1], cleanedPts[i]));
+    }
+
+    // Stage 2: Detect only genuine Turns (>=58°), Curves (28°-57°), and Road Junction Changes
+    // using a 12m chord window so isolated vertex jitter never triggers false alerts.
+    const maneuvers: {
+      turnType: TurnDirection;
+      roadName: string;
+      sameRoad: boolean;
+      anchorPoint: { lat: number; lng: number };
+      cleanedCumMeters: number;
+    }[] = [
+      {
+        turnType: 'depart',
+        roadName: cleanedSegMeta[0]?.roadName ?? edgeSeq[0].roadName,
+        sameRoad: true,
+        anchorPoint: fullPolyline[0],
+        cleanedCumMeters: 0,
+      },
+    ];
+
+    for (let v = 1; v < cleanedPts.length - 1; v++) {
+      const segBefore = cleanedSegMeta[v - 1];
+      const segAfter = cleanedSegMeta[v];
+      if (!segBefore || !segAfter) continue;
+
+      const roadChanged =
+        segBefore.roadId !== segAfter.roadId || segBefore.roadName !== segAfter.roadName;
+
+      const backPt = pointAlongCleanedBack(cleanedPts, cleanedCum, v, 12);
+      const aheadPt = pointAlongCleanedAhead(cleanedPts, cleanedCum, v, 12);
+      const inBearing = calculateBearing(backPt, cleanedPts[v]);
+      const outBearing = calculateBearing(cleanedPts[v], aheadPt);
+      const turn = getTurnDirection(inBearing, outBearing);
+
+      if (!roadChanged && turn === 'straight') {
+        continue;
+      }
+
+      const prevManeuver = maneuvers[maneuvers.length - 1];
+      const distSincePrev = cleanedCum[v] - prevManeuver.cleanedCumMeters;
+
+      // Suppress rapid back-to-back chatter (< 10m apart on the same road)
+      if (!roadChanged && prevManeuver.turnType !== 'depart' && distSincePrev < 10) {
+        continue;
+      }
+
+      const emittedTurn: TurnDirection = turn === 'straight' ? 'straight' : turn;
+      maneuvers.push({
+        turnType: emittedTurn,
+        roadName: segAfter.roadName,
+        sameRoad: !roadChanged,
+        anchorPoint: cleanedPts[v],
+        cleanedCumMeters: cleanedCum[v],
+      });
+    }
+
+    // Stage 3: Map each maneuver monotonically onto fullPolyline to compute exact along-road meters
+    let searchStartIdx = 0;
+    const maneuverPolyCums: number[] = [];
+    for (let m = 0; m < maneuvers.length; m++) {
+      if (m === 0) {
+        maneuverPolyCums.push(0);
+        continue;
+      }
+      const target = maneuvers[m].anchorPoint;
+      let bestIdx = searchStartIdx;
+      let bestD = Infinity;
+      for (let pi = searchStartIdx; pi < fullPolyline.length; pi++) {
+        const d = haversineMeters(target, fullPolyline[pi]);
+        if (d < bestD) {
+          bestD = d;
+          bestIdx = pi;
+        }
+        if (d < 0.8) break;
+      }
+      searchStartIdx = bestIdx;
+      maneuverPolyCums.push(fullPolyCum[bestIdx] ?? maneuvers[m].cleanedCumMeters);
+    }
+
+    for (let m = 0; m < maneuvers.length; m++) {
+      const curCum = maneuverPolyCums[m];
+      const nextCum = m + 1 < maneuvers.length ? maneuverPolyCums[m + 1] : totalPolyMeters;
+      const man = maneuvers[m];
+      instructions.push({
+        id: `inst-${routeIndex}-${m}`,
+        turnType: man.turnType,
+        instruction: formatTurnAction(man.turnType, man.roadName, man.sameRoad),
+        roadName: man.roadName,
+        distanceMeters: Math.max(0, Math.round(nextCum - curCum)),
+        cumDistanceMeters: Math.round(curCum),
+        anchorPoint: man.anchorPoint,
+      });
+    }
   } else {
     const shopLabel = targetHouse.shopName ? ` (${targetHouse.shopName})` : '';
     instructions.push({
@@ -704,6 +844,7 @@ function buildRouteResultFromPath(
       instruction: `Walk toward House ${targetHouse.houseNumber}${shopLabel}`,
       roadName: targetHouse.roadName,
       distanceMeters: Math.round(haversineMeters(userStart, targetHouse)),
+      cumDistanceMeters: 0,
       anchorPoint: userStart,
     });
   }
@@ -721,13 +862,9 @@ function buildRouteResultFromPath(
     instruction: `Stop on road · House ${targetHouse.houseNumber}${shopSuffix} is on your ${sideText}`,
     roadName: `House ${targetHouse.houseNumber}${shopSuffix} (${sideText})`,
     distanceMeters: 0,
+    cumDistanceMeters: Math.round(totalPolyMeters),
     anchorPoint: roadEndPt,
   });
-
-  const fullPolyline = [...polyline];
-  if (startApproachMeters > 5) {
-    fullPolyline.unshift({ lat: userStart.lat, lng: userStart.lng });
-  }
 
   const totalDistanceMeters = Math.round(
     trueDistMeters + (startApproachMeters > 5 ? startApproachMeters : 0)
@@ -738,7 +875,7 @@ function buildRouteResultFromPath(
 
   return {
     reachable: true,
-    routeLabel: routeIndex === 0 ? 'Shortest Route' : `Alt Route ${routeIndex}`,
+    routeLabel: routeIndex === 0 ? 'Shortest (Closest)' : `Route ${routeIndex + 1}`,
     viaSummary,
     totalDistanceMeters,
     walkMinutes: Math.max(1, Math.round(totalDistanceMeters / 75)),
@@ -749,14 +886,14 @@ function buildRouteResultFromPath(
 }
 
 /**
- * Finds up to 3 distinct road-following routes from user's location to the target house,
- * comparing time & distance across alternative saved village paths.
+ * Finds all distinct road-following routes (up to maxRoutes) between start and targetHouse,
+ * surfacing the shortest route first along with every alternative path through the network.
  */
 export function findRoutesToHouse(
   roads: VillageRoad[],
   start: { lat: number; lng: number },
   targetHouse: VillageHouse,
-  maxRoutes = 3
+  maxRoutes = 8
 ): VillageRouteResult[] {
   if (roads.length === 0) {
     return [
@@ -787,35 +924,83 @@ export function findRoutesToHouse(
     ];
   }
 
-  const penalized = new Map<number, number>();
   const foundPaths: { nodeSeq: number[]; edgeSeq: GraphEdge[]; trueDistMeters: number }[] = [];
   const seenSignatures = new Set<string>();
 
-  for (let attempt = 0; attempt < maxRoutes * 2 && foundPaths.length < maxRoutes; attempt++) {
+  const tryAcceptPath = (res: {
+    nodeSeq: number[];
+    edgeSeq: GraphEdge[];
+    trueDistMeters: number;
+  } | null) => {
+    if (!res) return false;
+    const sig = res.nodeSeq.join('-');
+    if (seenSignatures.has(sig)) return false;
+
+    const bestDist = foundPaths[0]?.trueDistMeters ?? res.trueDistMeters;
+    const withinDetourLimit =
+      foundPaths.length === 0 || res.trueDistMeters <= Math.max(bestDist * 4.0, bestDist + 650);
+    if (!withinDetourLimit) return false;
+
+    const isDistinct =
+      foundPaths.length === 0 ||
+      foundPaths.every((prev) => {
+        const prevEdges = new Set(prev.edgeSeq.map((e) => e.edgeId));
+        const shared = res.edgeSeq.filter((e) => prevEdges.has(e.edgeId)).length;
+        const maxShared = Math.max(0, Math.min(res.edgeSeq.length - 1, Math.floor(res.edgeSeq.length * 0.92)));
+        return shared <= maxShared || res.edgeSeq.length !== prev.edgeSeq.length;
+      });
+
+    if (!isDistinct) return false;
+    seenSignatures.add(sig);
+    foundPaths.push(res);
+    return true;
+  };
+
+  // Pass 1: Iterative edge-penalized Dijkstra for primary shortest + global detours
+  const penalized = new Map<number, number>();
+  for (let attempt = 0; attempt < maxRoutes * 3 && foundPaths.length < maxRoutes; attempt++) {
     const res = runDijkstra(graph.nodes, graph.adj, graph.startNode, graph.endNode, penalized);
     if (!res) break;
-
-    const sig = res.nodeSeq.join('-');
-    const bestDist = foundPaths[0]?.trueDistMeters ?? res.trueDistMeters;
-
-    if (!seenSignatures.has(sig)) {
-      const isDistinctEnough =
-        foundPaths.length === 0 ||
-        (res.trueDistMeters <= Math.max(bestDist * 2.4, bestDist + 250) &&
-          foundPaths.every((prev) => {
-            const prevEdges = new Set(prev.edgeSeq.map((e) => e.edgeId));
-            const shared = res.edgeSeq.filter((e) => prevEdges.has(e.edgeId)).length;
-            return shared < Math.max(1, Math.floor(res.edgeSeq.length * 0.85));
-          }));
-
-      if (isDistinctEnough) {
-        seenSignatures.add(sig);
-        foundPaths.push(res);
-      }
-    }
-
+    tryAcceptPath(res);
     for (const e of res.edgeSeq) {
       penalized.set(e.edgeId, (penalized.get(e.edgeId) ?? 0) + 1);
+    }
+  }
+
+  // Pass 2: Road/segment bypass probing around the shortest path to uncover every local branch alternative
+  if (foundPaths.length > 0 && foundPaths.length < maxRoutes) {
+    const primaryEdges = foundPaths[0].edgeSeq;
+    const uniqueRoadIds = Array.from(new Set(primaryEdges.map((e) => e.roadId)));
+
+    for (const roadId of uniqueRoadIds) {
+      if (foundPaths.length >= maxRoutes) break;
+      const roadBypassPenalty = new Map<number, number>();
+      for (const e of primaryEdges) {
+        if (e.roadId === roadId) roadBypassPenalty.set(e.edgeId, 4);
+      }
+      const res = runDijkstra(
+        graph.nodes,
+        graph.adj,
+        graph.startNode,
+        graph.endNode,
+        roadBypassPenalty
+      );
+      tryAcceptPath(res);
+    }
+
+    // Also probe bypassing individual edges of the shortest path (sampled for speed)
+    const step = Math.max(1, Math.floor(primaryEdges.length / 8));
+    for (let i = 0; i < primaryEdges.length && foundPaths.length < maxRoutes; i += step) {
+      const singleEdgePenalty = new Map<number, number>();
+      singleEdgePenalty.set(primaryEdges[i].edgeId, 4);
+      const res = runDijkstra(
+        graph.nodes,
+        graph.adj,
+        graph.startNode,
+        graph.endNode,
+        singleEdgePenalty
+      );
+      tryAcceptPath(res);
     }
   }
 
@@ -835,7 +1020,7 @@ export function findRoutesToHouse(
 
   foundPaths.sort((a, b) => a.trueDistMeters - b.trueDistMeters);
 
-  return foundPaths.map((p, idx) =>
+  return foundPaths.slice(0, maxRoutes).map((p, idx) =>
     buildRouteResultFromPath(
       graph.nodes,
       p.nodeSeq,
@@ -867,6 +1052,7 @@ export interface LiveRouteProgress {
   remainingBikeMinutes: number;
   offRouteMeters: number;
   activeStepIndex: number;
+  nextInstruction: NavigationInstruction | null;
   distanceToNextTurnMeters: number;
   nextBearingDeg: number;
   movementStatus: 'towards' | 'away' | 'steady';
@@ -879,6 +1065,13 @@ export function computeLiveRouteProgress(
 ): LiveRouteProgress | null {
   const poly = route.polyline;
   if (!route.reachable || poly.length < 2) return null;
+
+  // Single-pass cumulative polyline distance for ultra-fast O(N) live step & turn-distance lookup
+  const polyCum: number[] = [0];
+  for (let i = 1; i < poly.length; i++) {
+    polyCum.push(polyCum[i - 1] + haversineMeters(poly[i - 1], poly[i]));
+  }
+  const totalPolyMeters = polyCum[polyCum.length - 1] ?? 0;
 
   let bestSeg = 0;
   let bestDist = Infinity;
@@ -896,43 +1089,41 @@ export function computeLiveRouteProgress(
   const completedPolyline = [...poly.slice(0, bestSeg + 1), bestPt];
   const remainingPolyline = [bestPt, ...poly.slice(bestSeg + 1)];
 
-  const coveredMeters = computePathDistance(completedPolyline);
-  const remainingMeters = computePathDistance(remainingPolyline);
+  const coveredMeters = Math.round(polyCum[bestSeg] + haversineMeters(poly[bestSeg], bestPt));
+  const remainingMeters = Math.max(0, Math.round(totalPolyMeters - coveredMeters));
 
-  // Determine exact active step index based on cumulative road distance along the route
+  // Exact step advancement based on cumulative along-road meters
   let activeStepIndex = 0;
   if (route.instructions.length > 1) {
-    let minInstDist = Infinity;
-    for (let idx = 0; idx < route.instructions.length; idx++) {
-      const inst = route.instructions[idx];
-      // Find closest instruction anchor along or behind/near current user spot
-      const d = haversineMeters(bestPt, inst.anchorPoint);
-      if (d < minInstDist) {
-        minInstDist = d;
-        activeStepIndex = idx;
-      }
-    }
-    // Prefer the step whose segment we are currently walking on using cumulative instruction distances
-    let cum = 0;
-    for (let idx = 0; idx < route.instructions.length - 1; idx++) {
-      const nextCum = cum + Math.max(0, route.instructions[idx].distanceMeters);
-      if (coveredMeters >= cum - 4 && coveredMeters <= nextCum + 4) {
-        activeStepIndex = idx;
-        break;
-      }
-      cum = nextCum;
-    }
-    if (remainingMeters <= 15) {
+    if (remainingMeters <= 12) {
       activeStepIndex = route.instructions.length - 1;
+    } else {
+      for (let idx = 0; idx < route.instructions.length - 1; idx++) {
+        const instCum = route.instructions[idx].cumDistanceMeters;
+        if (instCum != null) {
+          if (coveredMeters >= instCum - 3) {
+            activeStepIndex = idx;
+          }
+        } else {
+          // Fallback if instruction lacks precomputed cumDistanceMeters
+          const nextStepStart = route.instructions[idx].distanceMeters;
+          if (coveredMeters >= nextStepStart) {
+            activeStepIndex = idx;
+          }
+        }
+      }
     }
   }
 
-  const nextInst =
+  const nextInstruction =
     activeStepIndex + 1 < route.instructions.length
       ? route.instructions[activeStepIndex + 1]
       : null;
-  const distanceToNextTurnMeters = nextInst
-    ? Math.round(haversineMeters(bestPt, nextInst.anchorPoint))
+
+  const distanceToNextTurnMeters = nextInstruction
+    ? nextInstruction.cumDistanceMeters != null
+      ? Math.max(0, Math.round(nextInstruction.cumDistanceMeters - coveredMeters))
+      : Math.round(haversineMeters(bestPt, nextInstruction.anchorPoint))
     : remainingMeters;
 
   const aheadTarget =
@@ -961,6 +1152,7 @@ export function computeLiveRouteProgress(
     remainingBikeMinutes: Math.max(1, Math.round(remainingMeters / 230)),
     offRouteMeters: Math.round(bestDist),
     activeStepIndex,
+    nextInstruction,
     distanceToNextTurnMeters,
     nextBearingDeg,
     movementStatus,

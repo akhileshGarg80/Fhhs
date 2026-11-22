@@ -69,6 +69,7 @@ interface VillageMapProps {
   interactionMode: MapInteractionMode;
   onMapClick: (lat: number, lng: number) => void;
   onNavigateHouse: (house: VillageHouse) => void;
+  onSelectRouteIndex?: (index: number) => void;
   onSelectPendingBranch?: (junction: RoadJunction, branchId: string) => void;
   onExitNavigation?: () => void;
   onCenterGps?: () => void;
@@ -158,6 +159,7 @@ export default function VillageMap({
   interactionMode,
   onMapClick,
   onNavigateHouse,
+  onSelectRouteIndex,
   onSelectPendingBranch,
   onExitNavigation,
   onCenterGps,
@@ -185,6 +187,8 @@ export default function VillageMap({
   onMapClickRef.current = onMapClick;
   const onNavigateHouseRef = useRef(onNavigateHouse);
   onNavigateHouseRef.current = onNavigateHouse;
+  const onSelectRouteIndexRef = useRef(onSelectRouteIndex);
+  onSelectRouteIndexRef.current = onSelectRouteIndex;
   const onSelectPendingBranchRef = useRef(onSelectPendingBranch);
   onSelectPendingBranchRef.current = onSelectPendingBranch;
   const onViewChangeRef = useRef(onViewChange);
@@ -1149,21 +1153,64 @@ export default function VillageMap({
     group.clearLayers();
     if (!targetHouse || !routeResult?.reachable || routeResult.polyline.length < 2) return;
 
-    for (const alt of alternativeRoutes) {
+    const shortestDist =
+      alternativeRoutes.length > 0 && alternativeRoutes[0]?.reachable
+        ? alternativeRoutes[0].totalDistanceMeters
+        : routeResult.totalDistanceMeters;
+
+    const altPalette = ['#475569', '#7c3aed', '#0891b2', '#b45309', '#be185d'];
+
+    for (let idx = 0; idx < alternativeRoutes.length; idx++) {
+      const alt = alternativeRoutes[idx];
       if (!alt.reachable || alt.polyline.length < 2 || alt === routeResult) continue;
       const altLatLngs = alt.polyline.map((p) => [p.lat, p.lng] as [number, number]);
-      L.polyline(altLatLngs, {
-        color: '#64748b',
-        weight: 4,
-        opacity: 0.5,
-        dashArray: '6 6',
+      const altColor = idx === 0 ? '#059669' : altPalette[(idx - 1) % altPalette.length];
+      const extraM = Math.max(0, alt.totalDistanceMeters - shortestDist);
+      const shortTag =
+        idx === 0
+          ? `Shortest · ${formatDistance(alt.totalDistanceMeters)}`
+          : `R${idx + 1} · ${formatDistance(alt.totalDistanceMeters)}${
+              extraM > 0 ? ` (+${formatDistance(extraM)})` : ''
+            }`;
+
+      const altPoly = L.polyline(altLatLngs, {
+        color: altColor,
+        weight: 4.5,
+        opacity: 0.72,
+        dashArray: '7 6',
         lineCap: 'round',
         lineJoin: 'round',
+        interactive: true,
       })
-        .bindTooltip(
-          `${alt.routeLabel ?? 'Alt Route'} · ${formatDistance(alt.totalDistanceMeters)} (${alt.walkMinutes} min walk)`
-        )
+        .bindTooltip(`${shortTag} · Tap to select`, { sticky: true })
         .addTo(group);
+
+      altPoly.on('click', (ev) => {
+        L.DomEvent.stopPropagation(ev);
+        onSelectRouteIndexRef.current?.(idx);
+      });
+
+      // Place a clickable midpoint label pill so users immediately see every alternative path
+      const midIdx = Math.floor(alt.polyline.length / 2);
+      const midPt = alt.polyline[midIdx];
+      if (midPt) {
+        const badgeIcon = L.divIcon({
+          className: 'grampath-alt-route-badge',
+          iconSize: [94, 22],
+          iconAnchor: [47, 11],
+          html: `<div style="height:22px;padding:0 7px;border-radius:6px;background:${
+            idx === 0 ? '#ecfdf5' : '#ffffff'
+          };color:${altColor};border:1.5px solid ${altColor};font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-shadow:0 2px 5px rgba(15,23,42,0.22);cursor:pointer;">${shortTag}</div>`,
+        });
+        const badgeMarker = L.marker([midPt.lat, midPt.lng], {
+          icon: badgeIcon,
+          zIndexOffset: 380,
+        }).addTo(group);
+        badgeMarker.on('click', (ev) => {
+          L.DomEvent.stopPropagation(ev);
+          onSelectRouteIndexRef.current?.(idx);
+        });
+      }
     }
 
     // Already covered behind user
@@ -1204,6 +1251,26 @@ export default function VillageMap({
       lineJoin: 'round',
     }).addTo(group);
 
+    if ((startHouse || alternativeRoutes.length > 1) && routeResult.polyline.length >= 2) {
+      const selMidPt = routeResult.polyline[Math.floor(routeResult.polyline.length / 2)];
+      if (selMidPt) {
+        const activeLabel = `${routeResult.routeLabel ?? 'Selected'} · ${formatDistance(
+          routeResult.totalDistanceMeters
+        )}`;
+        const selIcon = L.divIcon({
+          className: 'grampath-active-route-badge',
+          iconSize: [132, 24],
+          iconAnchor: [66, 12],
+          html: `<div style="height:24px;padding:0 8px;border-radius:6px;background:#1d4ed8;color:#ffffff;border:2px solid #ffffff;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-shadow:0 2px 6px rgba(15,23,42,0.35);">${activeLabel}</div>`,
+        });
+        L.marker([selMidPt.lat, selMidPt.lng], {
+          icon: selIcon,
+          interactive: false,
+          zIndexOffset: 420,
+        }).addTo(group);
+      }
+    }
+
     // Subtle directional chevrons every ~26m along remaining route so road direction is unmistakable
     let accum = 0;
     for (let i = 1; i < aheadPts.length; i++) {
@@ -1229,14 +1296,23 @@ export default function VillageMap({
       }
     }
 
-    if (activeInstruction && activeInstruction.turnType !== 'arrive') {
-      L.circleMarker([activeInstruction.anchorPoint.lat, activeInstruction.anchorPoint.lng], {
-        radius: 7,
+    // Show clean visual pins at actual turns and curves along the selected route
+    for (const inst of routeResult.instructions) {
+      if (inst.turnType === 'depart' || inst.turnType === 'arrive' || inst.turnType === 'straight') {
+        continue;
+      }
+      const isCurve = inst.turnType === 'slight_left' || inst.turnType === 'slight_right';
+      const isNextAnchor =
+        liveProgress?.nextInstruction?.id === inst.id || activeInstruction?.id === inst.id;
+      L.circleMarker([inst.anchorPoint.lat, inst.anchorPoint.lng], {
+        radius: isNextAnchor ? 7 : 5,
         color: '#ffffff',
         weight: 2,
-        fillColor: '#f59e0b',
+        fillColor: isCurve ? '#0ea5e9' : '#f59e0b',
         fillOpacity: 1,
-      }).addTo(group);
+      })
+        .bindTooltip(inst.instruction)
+        .addTo(group);
     }
 
     // Start house (Point A) dotted connector + dot when checking route between 2 houses in Preview
@@ -1486,40 +1562,51 @@ export default function VillageMap({
       </div>
 
       {/* Real-Time Turn + Remaining Distance + Movement Status HUD */}
-      {targetHouse && activeInstruction && (
-        <div
-          className={`absolute ${
-            topControlsOffset ? 'top-[96px] md:top-[60px]' : 'top-14'
-          } left-1/2 -translate-x-1/2 z-[460] w-[calc(100%-1rem)] max-w-md pointer-events-none`}
-        >
-          <div className="px-3.5 py-2.5 rounded-xl shadow-lg bg-slate-900/95 backdrop-blur-sm text-white space-y-1.5">
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-lg bg-white/15 flex items-center justify-center shrink-0">
-                <TurnIcon turn={activeInstruction.turnType} className="w-5 h-5 text-white" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
-                  <span className="text-emerald-300 font-semibold">
-                    {activeInstruction.turnType === 'arrive'
-                      ? `Target: House ${targetHouse.houseNumber}${
-                          targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
-                        }`
-                      : distanceToNextTurnMeters != null
-                      ? `In ${formatDistance(distanceToNextTurnMeters)}`
-                      : formatDistance(activeInstruction.distanceMeters)}
-                  </span>
-                  {liveProgress && (
-                    <span className="text-sky-300 font-semibold">
-                      {formatDistance(liveProgress.remainingMeters)} left ·{' '}
-                      {liveProgress.remainingWalkMinutes}m
+      {targetHouse && activeInstruction && (() => {
+        const isArrivedStep = activeInstruction.turnType === 'arrive';
+        const upcomingInst =
+          !isArrivedStep && liveProgress?.nextInstruction ? liveProgress.nextInstruction : null;
+        const hudTurnType = upcomingInst ? upcomingInst.turnType : activeInstruction.turnType;
+        const hudMainText = upcomingInst ? upcomingInst.instruction : activeInstruction.instruction;
+        return (
+          <div
+            className={`absolute ${
+              topControlsOffset ? 'top-[96px] md:top-[60px]' : 'top-14'
+            } left-1/2 -translate-x-1/2 z-[460] w-[calc(100%-1rem)] max-w-md pointer-events-none`}
+          >
+            <div className="px-3.5 py-2.5 rounded-xl shadow-lg bg-slate-900/95 backdrop-blur-sm text-white space-y-1.5">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-white/15 flex items-center justify-center shrink-0">
+                  <TurnIcon turn={hudTurnType} className="w-5 h-5 text-white" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
+                    <span className="text-emerald-300 font-semibold">
+                      {isArrivedStep
+                        ? `Target: House ${targetHouse.houseNumber}${
+                            targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
+                          }`
+                        : distanceToNextTurnMeters != null
+                        ? `In ${formatDistance(distanceToNextTurnMeters)}`
+                        : formatDistance(activeInstruction.distanceMeters)}
                     </span>
+                    {liveProgress && (
+                      <span className="text-sky-300 font-semibold">
+                        {formatDistance(liveProgress.remainingMeters)} left ·{' '}
+                        {liveProgress.remainingWalkMinutes}m
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-xs sm:text-sm font-bold leading-snug truncate">
+                    {hudMainText}
+                  </div>
+                  {upcomingInst && (
+                    <div className="text-[10px] text-slate-300 truncate">
+                      Now: {activeInstruction.instruction}
+                    </div>
                   )}
                 </div>
-                <div className="text-xs sm:text-sm font-bold leading-snug truncate">
-                  {activeInstruction.instruction}
-                </div>
               </div>
-            </div>
 
             {liveProgress && (
               <div className="flex items-center justify-between text-[11px] border-t border-white/15 pt-1">
@@ -1547,7 +1634,8 @@ export default function VillageMap({
             )}
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
