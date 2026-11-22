@@ -2550,5 +2550,77 @@ export function summarizeVehicleHierarchy(roads: VillageRoad[]): VehicleHierarch
   };
 }
 
+/**
+ * Stamps vehicle access (`car`, `no_car`, or `unmarked`) onto all road segments within
+ * `radiusMeters` of `center`, then re-computes village road hierarchy automatically.
+ */
+export function stampVehicleBrushAt(
+  roads: VillageRoad[],
+  center: { lat: number; lng: number },
+  radiusMeters: number,
+  access: VehicleSegmentAccess
+): { nextRoads: VillageRoad[]; changed: boolean } {
+  let changed = false;
+
+  const updated = roads.map((r) => {
+    if (r.points.length < 2) return r;
+    const segCount = r.points.length - 1;
+    let cur: VehicleSegmentAccess[] | null = null;
+    let roadChanged = false;
+
+    for (let i = 0; i < segCount; i++) {
+      const a = r.points[i];
+      const b = r.points[i + 1];
+      const hit = projectPointOnSegment(center, a, b);
+      if (hit.distMeters <= radiusMeters) {
+        const existing: VehicleSegmentAccess =
+          r.segmentAccess && r.segmentAccess.length === segCount ? r.segmentAccess[i] : 'unmarked';
+        if (existing !== access) {
+          if (!cur) {
+            cur =
+              r.segmentAccess && r.segmentAccess.length === segCount
+                ? r.segmentAccess.slice()
+                : Array<VehicleSegmentAccess>(segCount).fill('unmarked');
+          }
+          cur[i] = access;
+          roadChanged = true;
+        }
+      }
+    }
+
+    if (!roadChanged || !cur) return r;
+    changed = true;
+    return {
+      ...r,
+      segmentAccess: cur,
+    };
+  });
+
+  if (!changed) {
+    return { nextRoads: roads, changed: false };
+  }
+  return { nextRoads: classifyVillageRoadHierarchy(updated), changed: true };
+}
+
+/**
+ * Marks any remaining `'unmarked'` road segments as `'no_car'` once Car-accessible corridors
+ * have been painted, then re-classifies Main Roads vs Car Streets vs Narrow Lanes.
+ */
+export function markRemainingUnmarkedAsNoCar(roads: VillageRoad[]): VillageRoad[] {
+  const updated = roads.map((r) => {
+    if (r.points.length < 2) return r;
+    const segCount = r.points.length - 1;
+    const cur: VehicleSegmentAccess[] =
+      r.segmentAccess && r.segmentAccess.length === segCount
+        ? r.segmentAccess.map((s) => (s === 'unmarked' ? 'no_car' : s))
+        : Array<VehicleSegmentAccess>(segCount).fill('no_car');
+    return {
+      ...r,
+      segmentAccess: cur,
+    };
+  });
+  return classifyVillageRoadHierarchy(updated);
+}
+
 
 

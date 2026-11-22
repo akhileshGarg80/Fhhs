@@ -6,27 +6,41 @@ import {
   ChevronRight,
   ChevronUp,
   Crosshair,
+  Eraser,
   Footprints,
+  Hand,
   List,
   Map as MapIcon,
   Maximize2,
   Pause,
+  Pencil,
   Play,
   RotateCcw,
+  Undo2,
 } from 'lucide-react';
 import { type ReactNode, useMemo, useState } from 'react';
-import type { VillageRoad } from '../types/map.ts';
+import type { VehicleSegmentAccess, VillageRoad } from '../types/map.ts';
 import {
   formatDistance,
   getSurfaceLabel,
   type VehicleHierarchySummary,
   type VehicleTourWaypoint,
 } from '../utils/geo.ts';
+import type { VehiclePaintTool } from './VillageMap.tsx';
 
 export type VehicleSimSpeed = 0.25 | 0.5 | 1 | 2 | 4;
 
 interface VehiclesWorkspaceProps {
   roads: VillageRoad[];
+  tool: VehiclePaintTool;
+  brushAccess: VehicleSegmentAccess;
+  brushRadiusMeters: number;
+  canUndo: boolean;
+  onSetTool: (tool: VehiclePaintTool) => void;
+  onSetBrushAccess: (access: VehicleSegmentAccess) => void;
+  onSetBrushRadius: (radiusMeters: number) => void;
+  onUndo: () => void;
+  onMarkRestNoCar: () => void;
   waypoints: VehicleTourWaypoint[];
   currentIdx: number;
   isPlaying: boolean;
@@ -55,6 +69,12 @@ const SPEED_OPTIONS: { speed: VehicleSimSpeed; label: string }[] = [
   { speed: 1, label: '1x' },
   { speed: 2, label: '2x' },
   { speed: 4, label: '4x' },
+];
+
+const BRUSH_RADII = [
+  { label: 'Fine 8m', r: 8 },
+  { label: 'Med 16m', r: 16 },
+  { label: 'Wide 26m', r: 26 },
 ];
 
 function getRoleBadge(role?: VillageRoad['roadRole']): {
@@ -96,6 +116,15 @@ function getRoleBadge(role?: VillageRoad['roadRole']): {
 
 export default function VehiclesWorkspace({
   roads,
+  tool,
+  brushAccess,
+  brushRadiusMeters,
+  canUndo,
+  onSetTool,
+  onSetBrushAccess,
+  onSetBrushRadius,
+  onUndo,
+  onMarkRestNoCar,
   waypoints,
   currentIdx,
   isPlaying,
@@ -118,6 +147,7 @@ export default function VehiclesWorkspace({
   mapSlot,
 }: VehiclesWorkspaceProps) {
   const [mobileRoadsOpen, setMobileRoadsOpen] = useState(false);
+  const [simDrawerOpen, setSimDrawerOpen] = useState(false);
 
   const safeIdx = waypoints.length > 0 ? Math.min(currentIdx, waypoints.length - 1) : 0;
   const activeWp = waypoints[safeIdx] ?? null;
@@ -130,11 +160,6 @@ export default function VehiclesWorkspace({
     waypoints.length > 0 ? Math.round(waypoints[waypoints.length - 1].cumulativeMeters) : 0;
   const coveredMeters = activeWp ? Math.round(activeWp.cumulativeMeters) : 0;
 
-  const currentSegmentStatus = useMemo(() => {
-    if (!activeRoad || !activeWp) return 'unmarked';
-    return activeRoad.segmentAccess?.[activeWp.segIndex] ?? 'unmarked';
-  }, [activeRoad, activeWp]);
-
   const validRoads = useMemo(() => roads.filter((r) => r.points.length >= 2), [roads]);
 
   const renderRoadsAndHierarchyPanel = () => (
@@ -143,14 +168,13 @@ export default function VehiclesWorkspace({
       <div className="p-3 border-b border-slate-200 dark:border-slate-800 space-y-2.5 bg-slate-50/70 dark:bg-slate-900/60">
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs font-bold text-slate-900 dark:text-slate-100">
-            Village Car Access &amp; Hierarchy
+            Car Access &amp; Main Roads
           </span>
           <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-mono font-bold text-slate-800 dark:text-slate-200">
-            {summary.surveyedPercent}% checked
+            {summary.surveyedPercent}% marked
           </span>
         </div>
 
-        {/* Auto-detected Main Roads Box */}
         <div className="p-2 rounded-xl bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-800">
           <div className="text-[10px] font-bold uppercase tracking-wider text-blue-800 dark:text-blue-300">
             Auto-Detected Main Road
@@ -161,12 +185,11 @@ export default function VehiclesWorkspace({
             </div>
           ) : (
             <div className="mt-1 text-[11px] text-blue-800/80 dark:text-blue-300/80">
-              Drive along the village with CAR ON / CAR OFF — connected Car corridors become Main Roads automatically.
+              Tap <strong>Pencil</strong> and trace over car-passable roads — connected Car roads auto-detect as Main Road.
             </div>
           )}
         </div>
 
-        {/* 4 Color Totals */}
         <div className="grid grid-cols-2 gap-1.5 text-[11px]">
           <div className="px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between">
             <span className="inline-flex items-center gap-1.5 text-slate-700 dark:text-slate-200 font-medium">
@@ -198,7 +221,7 @@ export default function VehiclesWorkspace({
           <div className="px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between">
             <span className="inline-flex items-center gap-1.5 text-slate-700 dark:text-slate-200 font-medium">
               <span className="w-2.5 h-2.5 rounded-full bg-slate-400 shrink-0" />
-              Left
+              Unmarked
             </span>
             <span className="font-mono font-bold text-slate-600 dark:text-slate-300">
               {formatDistance(summary.unmarkedMeters)}
@@ -218,37 +241,59 @@ export default function VehiclesWorkspace({
             const isCurrent = activeRoad?.id === road.id;
             const badge = getRoleBadge(road.roadRole);
             return (
-              <button
+              <div
                 key={road.id}
-                type="button"
-                onClick={() => {
-                  onJumpToRoad(road.id);
-                  setMobileRoadsOpen(false);
-                }}
-                className={`w-full text-left px-3 py-2.5 transition-colors cursor-pointer ${
+                className={`px-3 py-2 transition-colors ${
                   isCurrent
                     ? 'bg-sky-50 dark:bg-sky-950/50 border-l-4 border-l-sky-600'
                     : 'hover:bg-slate-50 dark:hover:bg-slate-800/60'
                 }`}
               >
                 <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onJumpToRoad(road.id);
+                      setMobileRoadsOpen(false);
+                    }}
+                    className="flex items-center gap-1.5 min-w-0 text-left cursor-pointer"
+                  >
                     <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${badge.dotClass}`} />
                     <span className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate">
                       {road.name}
                     </span>
-                  </div>
+                  </button>
                   <span
                     className={`px-1.5 py-0.5 rounded border text-[9px] font-bold shrink-0 ${badge.badgeClass}`}
                   >
                     {badge.label}
                   </span>
                 </div>
-                <div className="mt-0.5 flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400">
-                  <span className="truncate">{getSurfaceLabel(road.surface)}</span>
-                  <span className="font-mono tabular-nums">{formatDistance(road.distanceMeters)}</span>
+                <div className="mt-1 flex items-center justify-between gap-1 text-[10px] text-slate-500 dark:text-slate-400">
+                  <span>
+                    {getSurfaceLabel(road.surface)} ·{' '}
+                    <span className="font-mono tabular-nums">
+                      {formatDistance(road.distanceMeters)}
+                    </span>
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => onStampWholeRoad(road.id, 'car')}
+                      className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300 font-bold cursor-pointer"
+                    >
+                      Car
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onStampWholeRoad(road.id, 'no_car')}
+                      className="px-1.5 py-0.5 rounded bg-orange-100 dark:bg-orange-950/70 text-orange-800 dark:text-orange-300 font-bold cursor-pointer"
+                    >
+                      No Car
+                    </button>
+                  </div>
                 </div>
-              </button>
+              </div>
             );
           })
         )}
@@ -259,78 +304,206 @@ export default function VehiclesWorkspace({
   return (
     <div className="h-full w-full flex flex-col lg:flex-row overflow-hidden bg-slate-50 dark:bg-slate-950">
       {/* Desktop Left Sidebar */}
-      <aside className="hidden lg:flex lg:flex-col w-[305px] shrink-0 h-full bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800">
+      <aside className="hidden lg:flex lg:flex-col w-[300px] shrink-0 h-full bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800">
         {renderRoadsAndHierarchyPanel()}
       </aside>
 
-      {/* Main Column */}
+      {/* Main Map + Toolbar */}
       <div className="flex-1 min-w-0 min-h-0 flex flex-col relative">
-        {/* Slim Top Context & Map Action Strip */}
-        <div className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-2.5 sm:px-4 py-1.5 flex items-center justify-between gap-2 z-20">
-          <div className="flex items-center gap-2 min-w-0">
-            <button
-              type="button"
-              onClick={() => setMobileRoadsOpen((v) => !v)}
-              className="lg:hidden px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-bold text-slate-800 dark:text-slate-100 inline-flex items-center gap-1 cursor-pointer shrink-0"
-            >
-              <List className="w-3.5 h-3.5" />
-              <span>Roads ({validRoads.length})</span>
-              {mobileRoadsOpen ? (
-                <ChevronUp className="w-3 h-3" />
-              ) : (
-                <ChevronDown className="w-3 h-3" />
-              )}
-            </button>
-
-            {activeRoad ? (
-              <div className="flex items-center gap-1.5 min-w-0">
-                <span className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate">
-                  {activeRoad.name}
-                </span>
-                <span
-                  className={`hidden sm:inline-block px-1.5 py-0.5 rounded border text-[10px] font-bold shrink-0 ${
-                    getRoleBadge(activeRoad.roadRole).badgeClass
+        {/* Top Primary Bar: Move Map | Car Pencil | Undo | Fit | Clean Map */}
+        <div className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-2 sm:px-4 py-1.5 space-y-1.5 z-20">
+          <div className="flex flex-wrap items-center justify-between gap-1.5">
+            {/* Move Map & Pencil Tool Switcher */}
+            <div className="flex items-center gap-1.5">
+              <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl border border-slate-200 dark:border-slate-700">
+                <button
+                  type="button"
+                  onClick={() => onSetTool('pan')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                    tool === 'pan'
+                      ? 'bg-slate-900 dark:bg-sky-600 text-white shadow-xs'
+                      : 'text-slate-700 dark:text-slate-300 hover:text-slate-900'
                   }`}
                 >
-                  {getRoleBadge(activeRoad.roadRole).label}
-                </span>
-                {currentSegmentStatus !== 'unmarked' && (
-                  <span
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
-                      currentSegmentStatus === 'car'
-                        ? 'bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-200'
-                        : 'bg-orange-100 dark:bg-orange-950/70 text-orange-800 dark:text-orange-200'
-                    }`}
-                  >
-                    {currentSegmentStatus === 'car' ? 'Car OK' : 'No Car'}
-                  </span>
-                )}
+                  <Hand className="w-3.5 h-3.5" />
+                  <span>Move</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onSetTool('pencil')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                    tool === 'pencil'
+                      ? brushAccess === 'car'
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : brushAccess === 'no_car'
+                        ? 'bg-orange-600 text-white shadow-xs'
+                        : 'bg-slate-700 text-white shadow-xs'
+                      : 'text-slate-700 dark:text-slate-300 hover:text-emerald-700'
+                  }`}
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Pencil</span>
+                </button>
               </div>
-            ) : (
-              <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">
-                No mapped roads
-              </span>
-            )}
+
+              <button
+                type="button"
+                disabled={!canUndo}
+                onClick={onUndo}
+                title="Undo last brush stroke"
+                className="px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 disabled:opacity-35 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Undo</span>
+              </button>
+            </div>
+
+            {/* Right Actions: Mobile Roads, Auto-Sim toggle, Fit All, Clean Map */}
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setMobileRoadsOpen((v) => !v)}
+                className="lg:hidden px-2 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-bold text-slate-800 dark:text-slate-100 inline-flex items-center gap-1 cursor-pointer"
+              >
+                <List className="w-3.5 h-3.5" />
+                <span>{validRoads.length}</span>
+                {mobileRoadsOpen ? (
+                  <ChevronUp className="w-3 h-3" />
+                ) : (
+                  <ChevronDown className="w-3 h-3" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSimDrawerOpen((v) => !v)}
+                title="Show/Hide Slow Vehicle Tour Simulator"
+                className={`px-2 py-1.5 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer ${
+                  simDrawerOpen || isPlaying
+                    ? 'bg-sky-600 border-sky-700 text-white'
+                    : 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                }`}
+              >
+                <Car className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Sim</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={onFitAllRoads}
+                title="Fit all village roads"
+                className="px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                type="button"
+                onClick={onOpenCleanMap}
+                className="px-2.5 py-1.5 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shadow-xs"
+              >
+                <MapIcon className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Clean Map</span>
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-1.5 shrink-0">
-            <button
-              type="button"
-              onClick={onFitAllRoads}
-              title="Fit all village roads"
-              className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1 cursor-pointer"
-            >
-              <Maximize2 className="w-3 h-3" />
-              <span className="hidden sm:inline">Fit All</span>
-            </button>
-            <button
-              type="button"
-              onClick={onOpenCleanMap}
-              className="px-2.5 py-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shadow-xs"
-            >
-              <MapIcon className="w-3.5 h-3.5" />
-              <span>Clean Map</span>
-            </button>
+          {/* Pencil Sub-Bar: Paint Type (Car OK / No Car / Clear), Brush Size, Rest = No Car */}
+          <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1 border-t border-slate-100 dark:border-slate-800 text-[11px]">
+            <div className="flex flex-wrap items-center gap-1">
+              <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSetBrushAccess('car');
+                    onSetTool('pencil');
+                  }}
+                  className={`px-2 py-1 rounded-md text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer ${
+                    brushAccess === 'car'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <Car className="w-3 h-3" />
+                  <span>Car Goes</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSetBrushAccess('no_car');
+                    onSetTool('pencil');
+                  }}
+                  className={`px-2 py-1 rounded-md text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer ${
+                    brushAccess === 'no_car'
+                      ? 'bg-orange-600 text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <Ban className="w-3 h-3" />
+                  <span>No Car</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSetBrushAccess('unmarked');
+                    onSetTool('pencil');
+                  }}
+                  className={`px-2 py-1 rounded-md text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer ${
+                    brushAccess === 'unmarked'
+                      ? 'bg-slate-700 text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <Eraser className="w-3 h-3" />
+                  <span>Clear</span>
+                </button>
+              </div>
+
+              <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
+                {BRUSH_RADII.map((b) => (
+                  <button
+                    key={b.r}
+                    type="button"
+                    onClick={() => onSetBrushRadius(b.r)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold cursor-pointer ${
+                      brushRadiusMeters === b.r
+                        ? 'bg-slate-900 dark:bg-sky-600 text-white'
+                        : 'text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5 ml-auto">
+              {summary.unmarkedMeters > 0 &&
+                summary.mainRoadMeters + summary.carStreetMeters > 0 && (
+                  <button
+                    type="button"
+                    onClick={onMarkRestNoCar}
+                    title="Mark all remaining unmarked narrow lanes as No Car"
+                    className="px-2 py-1 rounded-lg bg-orange-50 hover:bg-orange-100 dark:bg-orange-950/60 dark:hover:bg-orange-900/60 border border-orange-200 dark:border-orange-800 text-orange-800 dark:text-orange-200 text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <Footprints className="w-3 h-3" />
+                    <span>Rest = No Car</span>
+                  </button>
+                )}
+
+              {summary.surveyedPercent > 0 && (
+                <button
+                  type="button"
+                  onClick={onResetAllMarks}
+                  title="Reset all marks"
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-800 hover:bg-red-50 dark:hover:bg-red-950/50 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-red-700 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>Reset</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
@@ -341,195 +514,144 @@ export default function VehiclesWorkspace({
           </div>
         )}
 
-        {/* Interactive Map Area */}
+        {/* Roads-Only Map Viewport (No House Numbers!) */}
         <div className="flex-1 min-h-0 relative w-full">
           {mapSlot}
 
-          {/* Floating Compact Legend on Map */}
-          <div className="hidden sm:flex absolute bottom-2.5 left-1/2 -translate-x-1/2 z-[420] pointer-events-none">
-            <div className="px-2.5 py-1 rounded-lg bg-slate-900/85 text-white text-[10px] font-medium shadow flex items-center gap-3 whitespace-nowrap">
+          {/* Helpful floating hint / live Main Road readout */}
+          <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-[420] pointer-events-none max-w-[calc(100%-1.5rem)]">
+            <div className="px-2.5 py-1 rounded-lg bg-slate-900/85 text-white text-[10px] font-medium shadow flex items-center gap-2.5 whitespace-nowrap overflow-x-auto">
+              {tool === 'pencil' ? (
+                <span className="font-bold text-emerald-300">
+                  Drag finger along roads where car goes
+                </span>
+              ) : (
+                <span className="font-bold text-sky-300">Move map · Switch to Pencil to mark</span>
+              )}
               <span className="inline-flex items-center gap-1">
                 <span className="w-2.5 h-1 rounded-full bg-blue-500" />
-                Main Road
+                Main{summary.mainRoadNames.length > 0 ? `: ${summary.mainRoadNames[0]}` : ''}
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="w-2.5 h-1 rounded-full bg-emerald-500" />
-                Car Road
+                Car
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="w-2.5 h-1 rounded-full bg-orange-500" />
                 No Car
               </span>
-              <span className="text-slate-300">Tap any road on map to jump</span>
             </div>
           </div>
         </div>
 
-        {/* Bottom Vehicle Simulator & CAR ON/OFF Cockpit */}
-        <div className="shrink-0 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 px-2.5 sm:px-4 py-2 space-y-2 z-20 shadow-[0_-4px_16px_rgba(15,23,42,0.08)]">
-          {/* Top Row: Big CAR ON/OFF Switch + Play/Pause + Speed */}
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            {/* Primary CAR ON / CAR OFF Access Switch */}
-            <button
-              type="button"
-              disabled={waypoints.length === 0}
-              onClick={() => onSetCarOn(!carOn)}
-              className={`px-3.5 py-2 rounded-xl text-xs font-extrabold inline-flex items-center gap-2 shadow-sm cursor-pointer disabled:opacity-45 transition-colors ${
-                carOn
-                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white ring-2 ring-emerald-300 dark:ring-emerald-800'
-                  : 'bg-orange-600 hover:bg-orange-700 text-white ring-2 ring-orange-300 dark:ring-orange-800'
-              }`}
-            >
-              {carOn ? (
-                <>
-                  <Car className="w-4 h-4" />
-                  <span>CAR ON · Can Go</span>
-                </>
-              ) : (
-                <>
-                  <Ban className="w-4 h-4" />
-                  <span>CAR OFF · No Car</span>
-                </>
-              )}
-            </button>
-
-            {/* Play / Pause & Slow Playback Speed */}
-            <div className="flex items-center gap-1.5 flex-wrap">
+        {/* Optional Collapsible Tour Simulator Dock */}
+        {(simDrawerOpen || isPlaying) && (
+          <div className="shrink-0 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 px-2.5 sm:px-4 py-2 space-y-1.5 z-20 shadow-[0_-4px_16px_rgba(15,23,42,0.08)]">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <button
                 type="button"
-                disabled={waypoints.length < 2}
-                onClick={onTogglePlay}
-                className={`px-3 py-2 rounded-xl text-xs font-bold inline-flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-45 ${
-                  isPlaying
-                    ? 'bg-amber-600 hover:bg-amber-700 text-white'
-                    : 'bg-slate-900 dark:bg-sky-600 hover:bg-slate-800 dark:hover:bg-sky-500 text-white'
+                disabled={waypoints.length === 0}
+                onClick={() => onSetCarOn(!carOn)}
+                className={`px-3 py-1.5 rounded-xl text-xs font-extrabold inline-flex items-center gap-1.5 shadow-xs cursor-pointer ${
+                  carOn
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                    : 'bg-orange-600 hover:bg-orange-700 text-white'
                 }`}
               >
-                {isPlaying ? (
-                  <>
-                    <Pause className="w-3.5 h-3.5 fill-current" />
-                    <span>Pause</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3.5 h-3.5 fill-current" />
-                    <span>Drive Village</span>
-                  </>
-                )}
+                {carOn ? <Car className="w-3.5 h-3.5" /> : <Ban className="w-3.5 h-3.5" />}
+                <span>{carOn ? 'CAR ON' : 'CAR OFF'}</span>
               </button>
 
-              <div className="flex items-center gap-0.5 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl border border-slate-200 dark:border-slate-700">
-                {SPEED_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.speed}
-                    type="button"
-                    onClick={() => onSetSimSpeed(opt.speed)}
-                    className={`px-1.5 py-1 rounded-lg text-[10px] font-mono font-bold cursor-pointer ${
-                      simSpeed === opt.speed
-                        ? 'bg-sky-600 text-white shadow-xs'
-                        : 'text-slate-600 dark:text-slate-300'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Progress Scrubber Across All Village Roads */}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled={validRoads.length <= 1}
-              onClick={onPrevRoad}
-              title="Previous road"
-              aria-label="Previous road"
-              className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 disabled:opacity-40 cursor-pointer"
-            >
-              <ChevronLeft className="w-3.5 h-3.5" />
-            </button>
-
-            <input
-              type="range"
-              min={0}
-              max={Math.max(0, waypoints.length - 1)}
-              value={safeIdx}
-              disabled={waypoints.length < 2}
-              onChange={(e) => onJumpIndex(Number(e.target.value))}
-              aria-label="Village road tour position"
-              className="flex-1 h-2 accent-sky-600 cursor-pointer"
-            />
-
-            <button
-              type="button"
-              disabled={validRoads.length <= 1}
-              onClick={onNextRoad}
-              title="Next road"
-              aria-label="Next road"
-              className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 disabled:opacity-40 cursor-pointer"
-            >
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
-
-            <span className="text-[11px] font-mono tabular-nums font-bold text-slate-700 dark:text-slate-200 shrink-0">
-              {formatDistance(coveredMeters)} / {formatDistance(totalTourMeters)}
-            </span>
-          </div>
-
-          {/* Quick Road-Level Actions + Auto-Follow + Reset */}
-          <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {activeRoad && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => onStampWholeRoad(activeRoad.id, 'car')}
-                    className="px-2 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/50 dark:hover:bg-emerald-900/60 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 font-semibold inline-flex items-center gap-1 cursor-pointer"
-                  >
-                    <Car className="w-3 h-3" />
-                    <span>Whole Road: Car</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onStampWholeRoad(activeRoad.id, 'no_car')}
-                    className="px-2 py-1 rounded-lg bg-orange-50 hover:bg-orange-100 dark:bg-orange-950/50 dark:hover:bg-orange-900/60 border border-orange-200 dark:border-orange-800 text-orange-800 dark:text-orange-300 font-semibold inline-flex items-center gap-1 cursor-pointer"
-                  >
-                    <Footprints className="w-3 h-3" />
-                    <span>Whole Road: No Car</span>
-                  </button>
-                </>
-              )}
-            </div>
-
-            <div className="flex items-center gap-1.5 ml-auto">
-              <button
-                type="button"
-                onClick={onToggleAutoFollow}
-                className={`px-2 py-1 rounded-lg border font-semibold inline-flex items-center gap-1 cursor-pointer ${
-                  autoFollow
-                    ? 'bg-sky-50 dark:bg-sky-950/60 border-sky-300 dark:border-sky-800 text-sky-800 dark:text-sky-300'
-                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                }`}
-              >
-                <Crosshair className="w-3 h-3" />
-                <span>{autoFollow ? 'Follow ON' : 'Follow OFF'}</span>
-              </button>
-
-              {summary.surveyedPercent > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
-                  onClick={onResetAllMarks}
-                  title="Clear all car / no-car marks"
-                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-800 hover:bg-red-50 dark:hover:bg-red-950/50 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-red-700 font-semibold inline-flex items-center gap-1 cursor-pointer"
+                  disabled={waypoints.length < 2}
+                  onClick={onTogglePlay}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold inline-flex items-center gap-1 cursor-pointer ${
+                    isPlaying
+                      ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                      : 'bg-slate-900 dark:bg-sky-600 text-white'
+                  }`}
                 >
-                  <RotateCcw className="w-3 h-3" />
-                  <span>Reset</span>
+                  {isPlaying ? (
+                    <>
+                      <Pause className="w-3.5 h-3.5 fill-current" />
+                      <span>Pause</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      <span>Play Tour</span>
+                    </>
+                  )}
                 </button>
-              )}
+
+                <div className="flex items-center gap-0.5 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
+                  {SPEED_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.speed}
+                      type="button"
+                      onClick={() => onSetSimSpeed(opt.speed)}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold cursor-pointer ${
+                        simSpeed === opt.speed
+                          ? 'bg-sky-600 text-white'
+                          : 'text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={onToggleAutoFollow}
+                  className={`px-2 py-1 rounded-lg border text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer ${
+                    autoFollow
+                      ? 'bg-sky-50 dark:bg-sky-950/60 border-sky-300 dark:border-sky-800 text-sky-800 dark:text-sky-300'
+                      : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <Crosshair className="w-3 h-3" />
+                  <span>Follow</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={validRoads.length <= 1}
+                onClick={onPrevRoad}
+                aria-label="Previous road"
+                className="p-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 cursor-pointer"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, waypoints.length - 1)}
+                value={safeIdx}
+                disabled={waypoints.length < 2}
+                onChange={(e) => onJumpIndex(Number(e.target.value))}
+                className="flex-1 h-1.5 accent-sky-600 cursor-pointer"
+              />
+              <button
+                type="button"
+                disabled={validRoads.length <= 1}
+                onClick={onNextRoad}
+                aria-label="Next road"
+                className="p-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 cursor-pointer"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+              <span className="text-[10px] font-mono tabular-nums text-slate-600 dark:text-slate-300 shrink-0">
+                {formatDistance(coveredMeters)} / {formatDistance(totalTourMeters)}
+              </span>
             </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

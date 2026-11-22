@@ -39,6 +39,7 @@ import VillageMap, {
   type RoadEditorConfig,
   type RoadEditorTool,
   type VehicleOverlayConfig,
+  type VehiclePaintTool,
 } from './components/VillageMap.tsx';
 import type {
   AutoMapXNode,
@@ -77,8 +78,10 @@ import {
   getNextSequentialHouseNumber,
   haversineMeters,
   insertTouchPointIntoRoad,
+  markRemainingUnmarkedAsNoCar,
   offsetCoord,
   stampRoadSegmentAccess,
+  stampVehicleBrushAt,
   summarizeVehicleHierarchy,
   type VehicleTourWaypoint,
 } from './utils/geo.ts';
@@ -400,8 +403,14 @@ export default function App() {
   const amxModeRef = useRef(mode);
   amxModeRef.current = mode;
 
-  // Clean Roads-Only Map Mode + Village Vehicles Access Simulator State
+  // Clean Roads-Only Map Mode + Village Vehicles Access Simulator & Pencil State
   const [mapCleanScreen, setMapCleanScreen] = useState(false);
+  const [vehTool, setVehTool] = useState<VehiclePaintTool>('pencil');
+  const [vehBrushAccess, setVehBrushAccess] = useState<VehicleSegmentAccess>('car');
+  const [vehBrushRadius, setVehBrushRadius] = useState<number>(16);
+  const [vehBrushHistory, setVehBrushHistory] = useState<VillageRoad[][]>([]);
+  const vehPreStrokeRef = useRef<VillageRoad[] | null>(null);
+  const vehStrokeChangedRef = useRef(false);
   const [vehIdx, setVehIdx] = useState(0);
   const [vehIsPlaying, setVehIsPlaying] = useState(false);
   const [vehSpeed, setVehSpeed] = useState<VehicleSimSpeed>(0.5);
@@ -4372,6 +4381,44 @@ export default function App() {
     [vehTourWaypoints, vehIdx]
   );
 
+  const handleVehBrushStrokeStart = useCallback(() => {
+    vehPreStrokeRef.current = cloneRoadsSnapshot(roadsTourRef.current);
+    vehStrokeChangedRef.current = false;
+  }, [cloneRoadsSnapshot]);
+
+  const handleVehBrushAt = useCallback(
+    (lat: number, lng: number) => {
+      setRoads((prev) => {
+        const { nextRoads, changed } = stampVehicleBrushAt(
+          prev,
+          { lat, lng },
+          vehBrushRadius,
+          vehBrushAccess
+        );
+        if (!changed) return prev;
+        vehStrokeChangedRef.current = true;
+        return nextRoads;
+      });
+    },
+    [vehBrushRadius, vehBrushAccess]
+  );
+
+  const handleVehBrushStrokeEnd = useCallback(() => {
+    if (vehStrokeChangedRef.current && vehPreStrokeRef.current) {
+      const snap = vehPreStrokeRef.current;
+      setVehBrushHistory((h) => [...h.slice(-19), snap]);
+    }
+    vehPreStrokeRef.current = null;
+    vehStrokeChangedRef.current = false;
+  }, []);
+
+  const handleVehUndo = useCallback(() => {
+    if (vehBrushHistory.length === 0) return;
+    const prevSnap = vehBrushHistory[vehBrushHistory.length - 1];
+    setVehBrushHistory((h) => h.slice(0, -1));
+    setRoads(prevSnap);
+  }, [vehBrushHistory]);
+
   const activeVehWp =
     vehTourWaypoints.length > 0
       ? vehTourWaypoints[Math.min(vehIdx, vehTourWaypoints.length - 1)]
@@ -4382,13 +4429,32 @@ export default function App() {
     return {
       active: true,
       carOn: vehCarOn,
-      currentRoadId: activeVehWp?.roadId ?? null,
-      simPoint: activeVehWp
-        ? { lat: activeVehWp.lat, lng: activeVehWp.lng, headingDeg: activeVehWp.bearingDeg }
-        : null,
+      tool: vehTool,
+      brushAccess: vehBrushAccess,
+      brushRadiusMeters: vehBrushRadius,
+      currentRoadId: vehIsPlaying ? activeVehWp?.roadId ?? null : null,
+      simPoint:
+        vehIsPlaying && activeVehWp
+          ? { lat: activeVehWp.lat, lng: activeVehWp.lng, headingDeg: activeVehWp.bearingDeg }
+          : null,
       onSelectRoad: handleVehJumpToRoad,
+      onBrushStrokeStart: handleVehBrushStrokeStart,
+      onBrushAt: handleVehBrushAt,
+      onBrushStrokeEnd: handleVehBrushStrokeEnd,
     };
-  }, [mode, vehCarOn, activeVehWp, handleVehJumpToRoad]);
+  }, [
+    mode,
+    vehCarOn,
+    vehTool,
+    vehBrushAccess,
+    vehBrushRadius,
+    vehIsPlaying,
+    activeVehWp,
+    handleVehJumpToRoad,
+    handleVehBrushStrokeStart,
+    handleVehBrushAt,
+    handleVehBrushStrokeEnd,
+  ]);
 
   const cleanMapElement = (
     <VillageMap
@@ -4428,7 +4494,7 @@ export default function App() {
   const vehiclesMapElement = (
     <VillageMap
       roads={roads}
-      houses={houses}
+      houses={[]}
       draftHouses={[]}
       activeWalkSegments={[]}
       draftJunctions={[]}
@@ -4454,6 +4520,8 @@ export default function App() {
       }}
       onUserDrag={() => setVehAutoFollow(false)}
       focusTarget={focusTarget}
+      hideHouses={true}
+      hideGpsMarker={true}
       showVehicleHierarchy={true}
       vehicleOverlay={vehicleOverlayConfig}
     />
@@ -4760,6 +4828,18 @@ export default function App() {
           <div className="w-full h-full">
             <VehiclesWorkspace
               roads={roads}
+              tool={vehTool}
+              brushAccess={vehBrushAccess}
+              brushRadiusMeters={vehBrushRadius}
+              canUndo={vehBrushHistory.length > 0}
+              onSetTool={setVehTool}
+              onSetBrushAccess={setVehBrushAccess}
+              onSetBrushRadius={setVehBrushRadius}
+              onUndo={handleVehUndo}
+              onMarkRestNoCar={() => {
+                setVehBrushHistory((h) => [...h.slice(-19), cloneRoadsSnapshot(roads)]);
+                setRoads((prev) => markRemainingUnmarkedAsNoCar(prev));
+              }}
               waypoints={vehTourWaypoints}
               currentIdx={vehIdx}
               isPlaying={vehIsPlaying}
@@ -4800,10 +4880,12 @@ export default function App() {
               onPrevRoad={() => handleVehPrevNextRoad(-1)}
               onNextRoad={() => handleVehPrevNextRoad(1)}
               onStampWholeRoad={(roadId, access) => {
+                setVehBrushHistory((h) => [...h.slice(-19), cloneRoadsSnapshot(roads)]);
                 setRoads((prev) => stampRoadSegmentAccess(prev, roadId, 'all', access));
               }}
               onResetAllMarks={() => {
                 setVehIsPlaying(false);
+                setVehBrushHistory((h) => [...h.slice(-19), cloneRoadsSnapshot(roads)]);
                 setRoads((prev) =>
                   classifyVillageRoadHierarchy(
                     prev.map((r) => ({ ...r, segmentAccess: undefined, roadRole: 'unmarked' }))

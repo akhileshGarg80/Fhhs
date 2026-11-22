@@ -86,12 +86,20 @@ export interface RoadEditorConfig {
   onPointerHover?: (lat: number, lng: number) => void;
 }
 
+export type VehiclePaintTool = 'pan' | 'pencil';
+
 export interface VehicleOverlayConfig {
   active: boolean;
   carOn: boolean;
+  tool?: VehiclePaintTool;
+  brushAccess?: 'car' | 'no_car' | 'unmarked';
+  brushRadiusMeters?: number;
   currentRoadId: string | null;
   simPoint: { lat: number; lng: number; headingDeg: number } | null;
   onSelectRoad?: (roadId: string) => void;
+  onBrushStrokeStart?: () => void;
+  onBrushAt?: (lat: number, lng: number) => void;
+  onBrushStrokeEnd?: () => void;
 }
 
 interface VillageMapProps {
@@ -321,6 +329,8 @@ export default function VillageMap({
     map.on('click', (e: L.LeafletMouseEvent) => {
       const ed = roadEditorRef.current;
       if (ed?.enabled && (ed.tool === 'erase' || ed.tool === 'draw')) return;
+      const veh = vehicleOverlayRef.current;
+      if (veh?.active && veh.tool === 'pencil') return;
       onMapClickRef.current(e.latlng.lat, e.latlng.lng);
     });
 
@@ -429,8 +439,12 @@ export default function VillageMap({
     };
   }, [baseLayer]);
 
+  const isVehiclePencilActive = Boolean(
+    vehicleOverlay?.active && vehicleOverlay.tool === 'pencil'
+  );
   const isHandToolActive = Boolean(
-    roadEditor?.enabled && (roadEditor.tool === 'erase' || roadEditor.tool === 'draw')
+    (roadEditor?.enabled && (roadEditor.tool === 'erase' || roadEditor.tool === 'draw')) ||
+      isVehiclePencilActive
   );
 
   useEffect(() => {
@@ -439,7 +453,10 @@ export default function VillageMap({
     if (!container) return;
 
     if (isHandToolActive) {
-      container.style.cursor = roadEditor?.tool === 'erase' ? 'cell' : 'crosshair';
+      container.style.cursor =
+        roadEditor?.tool === 'erase'
+          ? 'cell'
+          : 'crosshair';
       container.style.touchAction = 'none';
       map?.dragging.disable();
       map?.doubleClickZoom.disable();
@@ -451,7 +468,7 @@ export default function VillageMap({
     }
   }, [interactionMode, isHandToolActive, roadEditor?.tool]);
 
-  // Native pointer listeners for silky hand-erase and hand-draw strokes (mouse & touchscreen)
+  // Native pointer listeners for silky hand-erase, hand-draw & Vehicle Car-Pencil strokes (mouse & touch)
   useEffect(() => {
     const container = containerRef.current;
     const map = mapRef.current;
@@ -465,6 +482,7 @@ export default function VillageMap({
 
     let pointerDownId: number | null = null;
     let lastErasePt: { lat: number; lng: number } | null = null;
+    let lastBrushPt: { lat: number; lng: number } | null = null;
     let drawStartScreen = { x: 0, y: 0 };
     let drawDidDrag = false;
     let drawStrokePts: LatLngPoint[] = [];
@@ -476,8 +494,28 @@ export default function VillageMap({
 
     const renderTransient = (lat: number, lng: number) => {
       const ed = roadEditorRef.current;
-      if (!transient || !ed?.enabled) return;
+      const veh = vehicleOverlayRef.current;
+      if (!transient) return;
       transient.clearLayers();
+
+      if (veh?.active && veh.tool === 'pencil') {
+        const radius = veh.brushRadiusMeters ?? 14;
+        const access = veh.brushAccess ?? 'car';
+        const ringColor =
+          access === 'car' ? '#059669' : access === 'no_car' ? '#ea580c' : '#64748b';
+        L.circle([lat, lng], {
+          radius,
+          color: ringColor,
+          weight: 2.5,
+          dashArray: '4 3',
+          fillColor: ringColor,
+          fillOpacity: 0.22,
+          interactive: false,
+        }).addTo(transient);
+        return;
+      }
+
+      if (!ed?.enabled) return;
       if (ed.tool === 'erase') {
         L.circle([lat, lng], {
           radius: ed.eraserRadiusMeters,
@@ -504,10 +542,45 @@ export default function VillageMap({
       }
     };
 
+    const sweepVehicleBrush = (from: { lat: number; lng: number }, to: { lat: number; lng: number }) => {
+      const veh = vehicleOverlayRef.current;
+      if (!veh?.active || !veh.onBrushAt) return;
+      const radius = veh.brushRadiusMeters ?? 14;
+      const dist = haversineMeters(from, to);
+      const step = Math.max(2.5, radius * 0.4);
+      if (dist <= step) {
+        veh.onBrushAt(to.lat, to.lng);
+        return;
+      }
+      const steps = Math.min(40, Math.ceil(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        veh.onBrushAt(from.lat + (to.lat - from.lat) * t, from.lng + (to.lng - from.lng) * t);
+      }
+    };
+
     const onPointerDown = (e: PointerEvent) => {
       if (e.button > 0) return;
       const target = e.target as HTMLElement | null;
       if (target?.closest('[data-map-hud="true"], .leaflet-control')) return;
+
+      const veh = vehicleOverlayRef.current;
+      if (veh?.active && veh.tool === 'pencil') {
+        e.preventDefault();
+        pointerDownId = e.pointerId;
+        try {
+          container.setPointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+        const ll = toLatLng(e.clientX, e.clientY);
+        veh.onBrushStrokeStart?.();
+        veh.onBrushAt?.(ll.lat, ll.lng);
+        lastBrushPt = { lat: ll.lat, lng: ll.lng };
+        renderTransient(ll.lat, ll.lng);
+        return;
+      }
+
       const ed = roadEditorRef.current;
       if (!ed?.enabled || (ed.tool !== 'erase' && ed.tool !== 'draw')) return;
 
@@ -535,9 +608,24 @@ export default function VillageMap({
     };
 
     const onPointerMove = (e: PointerEvent) => {
+      const veh = vehicleOverlayRef.current;
+      const ll = toLatLng(e.clientX, e.clientY);
+
+      if (veh?.active && veh.tool === 'pencil') {
+        renderTransient(ll.lat, ll.lng);
+        if (pointerDownId === e.pointerId) {
+          if (lastBrushPt) {
+            sweepVehicleBrush(lastBrushPt, { lat: ll.lat, lng: ll.lng });
+          } else {
+            veh.onBrushAt?.(ll.lat, ll.lng);
+          }
+          lastBrushPt = { lat: ll.lat, lng: ll.lng };
+        }
+        return;
+      }
+
       const ed = roadEditorRef.current;
       if (!ed?.enabled) return;
-      const ll = toLatLng(e.clientX, e.clientY);
 
       if (ed.tool === 'erase') {
         renderTransient(ll.lat, ll.lng);
@@ -570,9 +658,23 @@ export default function VillageMap({
       } catch {
         // ignore
       }
+
+      const veh = vehicleOverlayRef.current;
+      const ll = toLatLng(e.clientX, e.clientY);
+      if (veh?.active && veh.tool === 'pencil') {
+        if (lastBrushPt) {
+          sweepVehicleBrush(lastBrushPt, { lat: ll.lat, lng: ll.lng });
+        }
+        lastBrushPt = null;
+        veh.onBrushStrokeEnd?.();
+        if (e.pointerType !== 'mouse') {
+          transient?.clearLayers();
+        }
+        return;
+      }
+
       const ed = roadEditorRef.current;
       if (!ed?.enabled) return;
-      const ll = toLatLng(e.clientX, e.clientY);
 
       if (ed.tool === 'erase') {
         lastErasePt = null;
@@ -727,7 +829,7 @@ export default function VillageMap({
             lineCap: 'round',
             lineJoin: 'round',
           });
-          if (isVehicleSim) {
+          if (isVehicleSim && vehicleOverlay?.tool !== 'pencil') {
             segLine.on('click', (ev) => {
               L.DomEvent.stopPropagation(ev);
               vehicleOverlayRef.current?.onSelectRoad?.(r.id);
@@ -781,7 +883,7 @@ export default function VillageMap({
             L.DomEvent.stopPropagation(ev);
             roadEditorRef.current?.onSelectRoad(r.id);
           });
-        } else if (isVehicleSim) {
+        } else if (isVehicleSim && vehicleOverlay?.tool !== 'pencil') {
           line.on('click', (ev) => {
             L.DomEvent.stopPropagation(ev);
             vehicleOverlayRef.current?.onSelectRoad?.(r.id);
