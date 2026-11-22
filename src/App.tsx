@@ -128,6 +128,31 @@ export default function App() {
   const [accessRole, setAccessRole] = useState<UserAccessRole>('public');
   const [mode, setMode] = useState<WorkspaceMode>('navigate');
   const [travelMode, setTravelMode] = useState<TravelMode>('walk');
+  const [viewportHeight, setViewportHeight] = useState<number | null>(() =>
+    typeof window !== 'undefined'
+      ? Math.round(window.visualViewport?.height ?? window.innerHeight)
+      : null
+  );
+
+  useEffect(() => {
+    const syncViewport = () => {
+      const vv = window.visualViewport;
+      const h = vv ? Math.round(vv.height) : window.innerHeight;
+      if (h > 0) setViewportHeight(h);
+    };
+    syncViewport();
+    window.addEventListener('resize', syncViewport);
+    window.addEventListener('orientationchange', syncViewport);
+    window.visualViewport?.addEventListener('resize', syncViewport);
+    window.visualViewport?.addEventListener('scroll', syncViewport);
+    return () => {
+      window.removeEventListener('resize', syncViewport);
+      window.removeEventListener('orientationchange', syncViewport);
+      window.visualViewport?.removeEventListener('resize', syncViewport);
+      window.visualViewport?.removeEventListener('scroll', syncViewport);
+    };
+  }, []);
+
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
       return localStorage.getItem('grampath_theme') === 'dark' ? 'dark' : 'light';
@@ -4583,12 +4608,15 @@ export default function App() {
   const isPureRecordingScreen = mode === 'map' && mapCleanScreen;
 
   return (
-    <div className="h-[100dvh] w-screen flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
-      {/* Clean Top Header — GramPath + Saved Areas + Map + Vehicles */}
+    <div
+      style={viewportHeight ? { height: `${viewportHeight}px` } : undefined}
+      className="fixed inset-x-0 top-0 h-full w-full flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+    >
+      {/* Clean Top Header — GramPath + Saved Areas + Company Tools + Public/Company */}
       {!isPureRecordingScreen && (
-        <header className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-2 sm:px-5 h-11 flex items-center justify-between gap-1.5 z-[520] relative">
-          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1">
-            <span className="text-sm sm:text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
+        <header className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-2 sm:px-5 h-11 flex items-center justify-between gap-1 sm:gap-1.5 z-[520] relative">
+          <div className="flex items-center gap-1 sm:gap-2 min-w-0 flex-1">
+            <span className="text-[13px] sm:text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
               GramPath
             </span>
 
@@ -4598,7 +4626,7 @@ export default function App() {
                 type="button"
                 onClick={() => setSavedAreasMenuOpen((v) => !v)}
                 title="Saved Areas (click to switch or pin current area)"
-                className={`h-7 px-1.5 sm:px-2 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors max-w-[92px] sm:max-w-[165px] ${
+                className={`h-7 px-1.5 sm:px-2 rounded-lg border text-[10px] sm:text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors max-w-[74px] sm:max-w-[165px] ${
                   savedAreas.length > 0
                     ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
                     : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
@@ -4740,7 +4768,7 @@ export default function App() {
                   }`}
                 >
                   <MapIcon className="w-3.5 h-3.5 shrink-0" />
-                  <span className="hidden xs:inline sm:inline">Map</span>
+                  <span>Map</span>
                 </button>
 
                 <button
@@ -5491,7 +5519,7 @@ export default function App() {
 
               {/* Mobile Compact Bottom Sheet for Navigate */}
               <div className="lg:hidden absolute bottom-0 inset-x-0 z-[500]">
-                <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 rounded-t-2xl shadow-lg">
+                <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 rounded-t-2xl shadow-lg pb-[max(0.85rem,env(safe-area-inset-bottom))]">
                   <button
                     type="button"
                     onClick={() => setMobileSheetOpen((v) => !v)}
@@ -5600,7 +5628,7 @@ export default function App() {
                   )}
 
                   {mobileSheetOpen && (
-                    <div className="max-h-[58vh] overflow-y-auto border-t border-slate-100 dark:border-slate-800">
+                    <div className="max-h-[50dvh] overflow-y-auto border-t border-slate-100 dark:border-slate-800">
                       <NavigationPanel
                         houses={houses}
                         userLocation={userLocation}
@@ -5661,7 +5689,7 @@ export default function App() {
       {accessRole === 'company' && !isPureRecordingScreen && (
       <nav
         aria-label="Primary Workspace Navigation"
-        className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-1 sm:px-6 pt-1.5 pb-[max(1.1rem,env(safe-area-inset-bottom))] sm:py-1.5 grid grid-cols-5 items-center z-[530] shadow-[0_-4px_16px_rgba(15,23,42,0.08)] dark:shadow-[0_-4px_16px_rgba(0,0,0,0.35)]"
+        className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-1 sm:px-6 pt-1 pb-[max(1.1rem,calc(env(safe-area-inset-bottom)+0.45rem))] sm:py-1.5 grid grid-cols-5 items-center z-[530] shadow-[0_-4px_16px_rgba(15,23,42,0.08)] dark:shadow-[0_-4px_16px_rgba(0,0,0,0.35)]"
       >
         <button
           type="button"
