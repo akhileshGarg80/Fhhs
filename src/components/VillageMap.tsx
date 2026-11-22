@@ -20,7 +20,23 @@ import {
   offsetCoord,
 } from '../utils/geo.ts';
 import type { GpsQualityReport } from '../utils/gpsFilter.ts';
+import {
+  getEffectivePlaceType,
+  getPlaceBadgeLabel,
+  getPlaceColor,
+  getPlaceMarkerSvgHtml,
+  isPublicPoi,
+} from '../utils/placeMeta.ts';
 import { TurnIcon } from './NavigationPanel.tsx';
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 export type BaseLayerId = 'osm_standard' | 'osm_clean' | 'satellite';
 
@@ -119,6 +135,7 @@ interface VillageMapProps {
   darkMode?: boolean;
   isolateNavigation: boolean;
   hideHouses?: boolean;
+  publicPoiOnly?: boolean;
   hideGpsMarker?: boolean;
   cleanScreen?: boolean;
   showVehicleHierarchy?: boolean;
@@ -216,6 +233,7 @@ export default function VillageMap({
   darkMode = false,
   isolateNavigation,
   hideHouses = false,
+  publicPoiOnly = false,
   hideGpsMarker = false,
   cleanScreen = false,
   showVehicleHierarchy = false,
@@ -1298,19 +1316,17 @@ export default function VillageMap({
       for (const h of draftHouses) merged.set(h.id, h);
       for (const h of autoTripOverlay?.houses ?? []) merged.set(h.id, h);
       for (const h of autoMapXOverlay?.houses ?? []) merged.set(h.id, h);
-      visibleHouses = Array.from(merged.values());
+      const allMerged = Array.from(merged.values());
+      // In Public browse mode, keep the village map clean: show all roads + ONLY POIs (Shops, Temples, Schools, etc.)
+      visibleHouses = publicPoiOnly ? allMerged.filter((h) => isPublicPoi(h)) : allMerged;
     }
 
     for (const h of visibleHouses) {
       const isTarget = targetHouse?.id === h.id;
       const isStart = startHouse?.id === h.id;
-      const bg = isTarget
-        ? '#dc2626'
-        : isStart
-        ? '#0284c7'
-        : h.side === 'left'
-        ? '#15803d'
-        : '#d97706';
+      const pt = getEffectivePlaceType(h);
+      const isPoi = pt !== 'house';
+      const bg = getPlaceColor(pt, h.shopCategory, h.side, isStart, isTarget);
 
       const hasRouteConnector =
         (isTarget || isStart) && Boolean(routeResult?.reachable && routeResult.polyline.length >= 2);
@@ -1329,44 +1345,74 @@ export default function VillageMap({
         ).addTo(group);
       }
 
-      const hasShop = Boolean(h.shopName?.trim());
       const rolePrefix = isStart ? 'A·' : isTarget && startHouse ? 'B·' : '';
-      const shopTag = hasShop
-        ? `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="margin-left:3px;flex-shrink:0;"><path d="M3 9l1-5h16l1 5"/><path d="M3 9a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0"/><path d="M5 12v8h14v-8"/></svg>`
-        : '';
-      const labelW = (hasShop ? 44 : 30) + (rolePrefix ? 14 : 0);
+      const categorySvg = getPlaceMarkerSvgHtml(pt, h.shopCategory, isPoi ? 13 : 11);
+      const badgeLabel = getPlaceBadgeLabel(h);
+      const shortDisplay = isPoi
+        ? (h.shopName?.trim() || badgeLabel).slice(0, 14)
+        : h.houseNumber;
+      const labelText = `${rolePrefix}${shortDisplay}`;
+      const labelW = isPoi
+        ? Math.min(132, Math.max(46, 26 + labelText.length * 6.4))
+        : Math.max(36, 24 + labelText.length * 6.8);
+
       const icon = L.divIcon({
         className: 'grampath-marker-icon',
         iconSize: [labelW, 24],
         iconAnchor: [Math.round(labelW / 2), 12],
-        html: `<div style="min-width:${labelW - 2}px;height:22px;padding:0 6px;border-radius:6px;background:${bg};color:#fff;border:2px solid #fff;box-shadow:0 2px 6px rgba(15,23,42,0.35);display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;font-family:'JetBrains Mono',monospace;">${rolePrefix}${h.houseNumber}${shopTag}</div>`,
+        html: `<div style="min-width:${labelW - 2}px;max-width:132px;height:24px;padding:0 6px;border-radius:${
+          isPoi ? '9px' : '6px'
+        };background:${bg};color:#fff;border:2px solid #fff;box-shadow:0 2px 6px rgba(15,23,42,0.35);display:inline-flex;align-items:center;justify-content:center;gap:4px;font-weight:700;font-size:${
+          isPoi ? '10.5px' : '11px'
+        };font-family:${
+          isPoi ? 'system-ui,-apple-system,sans-serif' : "'JetBrains Mono',monospace"
+        };white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${categorySvg}<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(
+          labelText
+        )}</span></div>`,
       });
 
       const marker = L.marker([h.lat, h.lng], { icon });
       const popupEl = document.createElement('div');
       popupEl.style.fontSize = '12px';
-      popupEl.style.minWidth = '155px';
+      popupEl.style.minWidth = '165px';
       const titleColor = darkMode ? '#f1f5f9' : '#0f172a';
-      const shopColor = darkMode ? '#34d399' : '#047857';
+      const subAccentColor = darkMode ? '#34d399' : '#047857';
       const roadColor = darkMode ? '#94a3b8' : '#475569';
       const noteColor = darkMode ? '#cbd5e1' : '#334155';
+      const safeShopName = h.shopName?.trim() ? escapeHtml(h.shopName.trim()) : '';
+      const safeHouseNum = escapeHtml(h.houseNumber);
+      const safeRoadName = escapeHtml(h.roadName);
+      const safeNote = h.note?.trim() ? escapeHtml(h.note.trim()) : '';
+
       popupEl.innerHTML = `
-        <div style="font-weight:700;color:${titleColor};font-size:13px;">House ${h.houseNumber} (${
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px;">
+          <span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:6px;background:${bg};color:#fff;font-size:10px;font-weight:700;">${escapeHtml(
+            badgeLabel
+          )}</span>
+          <span style="font-size:11px;color:${roadColor};font-family:'JetBrains Mono',monospace;">#${safeHouseNum} · ${
         h.side === 'left' ? 'Left' : 'Right'
-      })</div>
+      }</span>
+        </div>
+        <div style="font-weight:700;color:${titleColor};font-size:13px;">${
+        safeShopName || (isPoi ? `${escapeHtml(badgeLabel)} #${safeHouseNum}` : `House ${safeHouseNum}`)
+      }</div>
         ${
-          hasShop
-            ? `<div style="font-weight:600;color:${shopColor};margin-top:2px;">Shop: ${h.shopName}</div>`
+          safeShopName && !isPoi
+            ? `<div style="font-weight:600;color:${subAccentColor};margin-top:2px;">${safeShopName}</div>`
             : ''
         }
-        <div style="color:${roadColor};margin-top:2px;">${h.roadName}</div>
-        ${h.note ? `<div style="color:${noteColor};margin-top:4px;">${h.note}</div>` : ''}
+        <div style="color:${roadColor};margin-top:2px;">${safeRoadName}</div>
+        ${safeNote ? `<div style="color:${noteColor};margin-top:4px;">${safeNote}</div>` : ''}
       `;
 
       if (!isTarget) {
         const navBtn = document.createElement('button');
         navBtn.type = 'button';
-        navBtn.textContent = hasShop ? `Track ${h.houseNumber} · ${h.shopName}` : `Track House ${h.houseNumber}`;
+        navBtn.textContent = h.shopName?.trim()
+          ? `Track · ${h.shopName.trim()}`
+          : isPoi
+          ? `Track ${badgeLabel}`
+          : `Track House ${h.houseNumber}`;
         navBtn.style.marginTop = '8px';
         navBtn.style.width = '100%';
         navBtn.style.padding = '6px 10px';
@@ -1396,6 +1442,7 @@ export default function VillageMap({
     targetHouse,
     isolateNavigation,
     hideHouses,
+    publicPoiOnly,
     routeResult,
     darkMode,
   ]);

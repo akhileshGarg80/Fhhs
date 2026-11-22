@@ -1,6 +1,7 @@
 import {
   Ban,
   Car,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -16,9 +17,10 @@ import {
   Pencil,
   Play,
   RotateCcw,
+  Save,
   Undo2,
 } from 'lucide-react';
-import { type ReactNode, useMemo, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import type { VehicleSegmentAccess, VillageRoad } from '../types/map.ts';
 import {
   formatDistance,
@@ -58,6 +60,7 @@ interface VehiclesWorkspaceProps {
   onNextRoad: () => void;
   onStampWholeRoad: (roadId: string, access: 'car' | 'no_car') => void;
   onResetAllMarks: () => void;
+  onSaveVehicleData: () => void;
   onFitAllRoads: () => void;
   onOpenCleanMap: () => void;
   mapSlot: ReactNode;
@@ -142,12 +145,28 @@ export default function VehiclesWorkspace({
   onNextRoad,
   onStampWholeRoad,
   onResetAllMarks,
+  onSaveVehicleData,
   onFitAllRoads,
   onOpenCleanMap,
   mapSlot,
 }: VehiclesWorkspaceProps) {
   const [mobileRoadsOpen, setMobileRoadsOpen] = useState(false);
   const [simDrawerOpen, setSimDrawerOpen] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+  const savedTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (savedTimerRef.current) window.clearTimeout(savedTimerRef.current);
+    };
+  }, []);
+
+  const handleSaveClick = () => {
+    onSaveVehicleData();
+    setJustSaved(true);
+    if (savedTimerRef.current) window.clearTimeout(savedTimerRef.current);
+    savedTimerRef.current = window.setTimeout(() => setJustSaved(false), 2200);
+  };
 
   const safeIdx = waypoints.length > 0 ? Math.min(currentIdx, waypoints.length - 1) : 0;
   const activeWp = waypoints[safeIdx] ?? null;
@@ -396,6 +415,29 @@ export default function VehiclesWorkspace({
                 className="px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1 cursor-pointer"
               >
                 <Maximize2 className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                type="button"
+                onClick={handleSaveClick}
+                title="Save Car route data for Public navigation"
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shadow-xs transition-colors ${
+                  justSaved
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-emerald-700 hover:bg-emerald-800 text-white'
+                }`}
+              >
+                {justSaved ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Saved</span>
+                  </>
+                ) : (
+                  <>
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save Car</span>
+                  </>
+                )}
               </button>
 
               <button

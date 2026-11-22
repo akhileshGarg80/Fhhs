@@ -35,7 +35,9 @@ import type {
   JunctionDirection,
   JunctionWayCount,
   LatLngPoint,
+  PlaceType,
   RoadJunction,
+  ShopCategory,
   VillageHouse,
   VillageRoad,
 } from '../types/map.ts';
@@ -47,6 +49,8 @@ import {
   haversineMeters,
 } from '../utils/geo.ts';
 import type { GpsPrecisionMode, GpsQualityReport } from '../utils/gpsFilter.ts';
+import { PLACE_TYPE_OPTIONS, SHOP_CATEGORY_OPTIONS } from '../utils/placeMeta.ts';
+import PlaceIcon from './PlaceIcon.tsx';
 
 export type StraightSymbolAction =
   | 'turn_left'
@@ -100,7 +104,9 @@ interface AddWalkWorkspaceProps {
     houseNumber: string,
     side: HouseSide,
     shopName?: string,
-    note?: string
+    note?: string,
+    placeType?: PlaceType,
+    shopCategory?: ShopCategory
   ) => void;
   onRemoveDraftHouse: (houseId: string) => void;
   onSaveWalkedRoad: (payload: {
@@ -184,6 +190,8 @@ export default function AddWalkWorkspace({
   mapSlot,
 }: AddWalkWorkspaceProps) {
   const [houseInput, setHouseInput] = useState(nextSuggestedHouse || '1');
+  const [placeType, setPlaceType] = useState<PlaceType>('house');
+  const [shopCategory, setShopCategory] = useState<ShopCategory>('kirana');
   const [shopName, setShopName] = useState('');
   const [houseNote, setHouseNote] = useState('');
   const [showNoteField, setShowNoteField] = useState(false);
@@ -250,14 +258,21 @@ export default function AddWalkWorkspace({
   const handleTagHouse = (side: HouseSide) => {
     const trimmed = houseInput.trim();
     if (!trimmed) return;
+    const effectiveType: PlaceType =
+      placeType === 'house' && shopName.trim() ? 'shop' : placeType;
     onAddHouseOnWalk(
       trimmed,
       side,
       shopName.trim() || undefined,
-      houseNote.trim() || undefined
+      houseNote.trim() || undefined,
+      effectiveType,
+      effectiveType === 'shop' ? shopCategory : undefined
     );
     setShopName('');
     setHouseNote('');
+    if (effectiveType !== 'house') {
+      setPlaceType('house');
+    }
     const numeric = Number(trimmed);
     if (Number.isInteger(numeric) && numeric >= 0) {
       setHouseInput(String(numeric + 1));
@@ -1225,6 +1240,53 @@ export default function AddWalkWorkspace({
               </button>
             )}
           </div>
+
+          {/* Compact Place Type & Shop Category Selector */}
+          <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5">
+            {PLACE_TYPE_OPTIONS.map((opt) => {
+              const active = placeType === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setPlaceType(opt.id)}
+                  style={active ? { backgroundColor: opt.color, borderColor: opt.color } : undefined}
+                  className={`px-2 py-1 rounded-lg border text-[10px] font-bold inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors ${
+                    active
+                      ? 'text-white shadow-xs'
+                      : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <PlaceIcon placeType={opt.id} className="w-3 h-3 shrink-0" />
+                  <span>{opt.shortLabel}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {placeType === 'shop' && (
+            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5">
+              {SHOP_CATEGORY_OPTIONS.map((cat) => {
+                const active = shopCategory === cat.id;
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    onClick={() => setShopCategory(cat.id)}
+                    style={active ? { backgroundColor: cat.color, borderColor: cat.color } : undefined}
+                    className={`px-2 py-1 rounded-lg border text-[10px] font-bold inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors ${
+                      active
+                        ? 'text-white shadow-xs'
+                        : 'bg-emerald-50/70 dark:bg-slate-800 border-emerald-200 dark:border-slate-700 text-emerald-900 dark:text-slate-300'
+                    }`}
+                  >
+                    <PlaceIcon placeType="shop" shopCategory={cat.id} className="w-3 h-3 shrink-0" />
+                    <span>{cat.shortLabel}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {showNoteField && (
             <input

@@ -16,7 +16,7 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type {
   NavigationInstruction,
   TravelMode,
@@ -25,6 +25,13 @@ import type {
   VillageRouteResult,
 } from '../types/map.ts';
 import { type LiveRouteProgress, formatDistance, haversineMeters } from '../utils/geo.ts';
+import {
+  getEffectivePlaceType,
+  getPlaceBadgeLabel,
+  getPlaceColor,
+  isPublicPoi,
+} from '../utils/placeMeta.ts';
+import PlaceIcon from './PlaceIcon.tsx';
 
 export function TurnIcon({
   turn,
@@ -106,6 +113,8 @@ export default function NavigationPanel({
   onToggleAutoSim,
   onFocusPoint,
 }: NavigationPanelProps) {
+  const [publicListTab, setPublicListTab] = useState<'places' | 'all'>('places');
+
   const sortedHouses = useMemo(() => {
     return [...houses]
       .map((h) => ({
@@ -114,6 +123,18 @@ export default function NavigationPanel({
       }))
       .sort((a, b) => a.dist - b.dist);
   }, [houses, userLocation]);
+
+  const poiCount = useMemo(
+    () => sortedHouses.filter(({ house }) => isPublicPoi(house)).length,
+    [sortedHouses]
+  );
+
+  const visibleListHouses = useMemo(() => {
+    if (readOnlyPublic && publicListTab === 'places') {
+      return sortedHouses.filter(({ house }) => isPublicPoi(house));
+    }
+    return sortedHouses;
+  }, [sortedHouses, readOnlyPublic, publicListTab]);
 
   const activeInstruction: NavigationInstruction | null =
     targetHouse && routeResult?.reachable && routeResult.instructions.length > 0
@@ -159,9 +180,13 @@ export default function NavigationPanel({
         <div>
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
             {targetHouse
-              ? `Navigating to House ${targetHouse.houseNumber}${
-                  targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
+              ? `${
+                  targetHouse.shopName?.trim()
+                    ? targetHouse.shopName.trim()
+                    : `House ${targetHouse.houseNumber}`
                 }`
+              : readOnlyPublic
+              ? 'Find Shop, Temple or House'
               : 'Find House or Shop'}
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
@@ -237,17 +262,32 @@ export default function NavigationPanel({
         <div className="p-4 space-y-4 flex-1">
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0">
-              <div className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
-                House {targetHouse.houseNumber} ·{' '}
-                {targetHouse.side === 'left' ? 'Left Side' : 'Right Side'}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span
+                  style={{
+                    backgroundColor: getPlaceColor(
+                      getEffectivePlaceType(targetHouse),
+                      targetHouse.shopCategory,
+                      targetHouse.side
+                    ),
+                  }}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold text-white shrink-0"
+                >
+                  <PlaceIcon
+                    placeType={getEffectivePlaceType(targetHouse)}
+                    shopCategory={targetHouse.shopCategory}
+                    shopName={targetHouse.shopName}
+                    className="w-3 h-3"
+                  />
+                  <span>{getPlaceBadgeLabel(targetHouse)}</span>
+                </span>
+                <span className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
+                  {targetHouse.shopName?.trim() || `House ${targetHouse.houseNumber}`} ·{' '}
+                  {targetHouse.side === 'left' ? 'Left' : 'Right'}
+                </span>
               </div>
-              {targetHouse.shopName && (
-                <div className="text-xs font-semibold text-emerald-800 dark:text-emerald-400 truncate">
-                  Shop: {targetHouse.shopName}
-                </div>
-              )}
-              <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                {targetHouse.roadName} · {targetHouse.villageName}
+              <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                #{targetHouse.houseNumber} · {targetHouse.roadName} · {targetHouse.villageName}
               </div>
               <div className="text-[11px] text-emerald-700 dark:text-emerald-400 font-medium mt-0.5">
                 {travelMode === 'car'
@@ -561,65 +601,117 @@ export default function NavigationPanel({
           )}
         </div>
       ) : (
-        /* House Quick List when not navigating */
+        /* Quick List when not navigating */
         <div className="p-4 flex-1 space-y-3">
-          <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Saved Houses (Closest first)</span>
-            <span className="font-mono tabular-nums">{houses.length} houses</span>
-          </div>
+          {readOnlyPublic ? (
+            <div className="flex items-center justify-between gap-2">
+              <div className="inline-flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-bold">
+                <button
+                  type="button"
+                  onClick={() => setPublicListTab('places')}
+                  className={`px-2 py-1 rounded-md cursor-pointer transition-colors ${
+                    publicListTab === 'places'
+                      ? 'bg-emerald-700 text-white'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  Shops &amp; Places ({poiCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPublicListTab('all')}
+                  className={`px-2 py-1 rounded-md cursor-pointer transition-colors ${
+                    publicListTab === 'all'
+                      ? 'bg-slate-900 dark:bg-sky-700 text-white'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  All ({sortedHouses.length})
+                </button>
+              </div>
+              <span className="text-[11px] text-slate-400 dark:text-slate-500">Closest</span>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+              <span>Saved Places &amp; Houses (Closest first)</span>
+              <span className="font-mono tabular-nums">{houses.length} saved</span>
+            </div>
+          )}
 
-          {sortedHouses.length === 0 ? (
+          {visibleListHouses.length === 0 ? (
             <div className="p-6 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl text-center text-xs text-slate-600 dark:text-slate-300">
               {readOnlyPublic ? (
-                <>
-                  No houses mapped in this area yet. Pick a saved area from the header or switch to{' '}
-                  <strong>Company</strong> mode to map roads &amp; houses.
-                </>
+                publicListTab === 'places' ? (
+                  <>
+                    No shops, temples, or schools tagged in this area yet. Use the top{' '}
+                    <strong>House / Shop</strong> search bar to find any house number directly.
+                  </>
+                ) : (
+                  <>
+                    No houses mapped in this area yet. Pick a saved area from the header or switch to{' '}
+                    <strong>Company</strong> mode to map roads &amp; places.
+                  </>
+                )
               ) : (
                 <>
                   No houses mapped yet. Use <strong>Add</strong> or <strong>AutoMapX</strong> to map
-                  a road and save Left / Right houses.
+                  a road and save Left / Right houses &amp; shops.
                 </>
               )}
             </div>
           ) : (
             <div className="border border-slate-200 dark:border-slate-700 rounded-xl divide-y divide-slate-200 dark:divide-slate-800">
-              {sortedHouses.map(({ house, dist }) => (
-                <div key={house.id} className="p-3 flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
-                      House {house.houseNumber}{' '}
-                      <span
-                        className={`text-xs font-medium ${
-                          house.side === 'left'
-                            ? 'text-emerald-700 dark:text-emerald-400'
-                            : 'text-amber-700 dark:text-amber-400'
-                        }`}
+              {visibleListHouses.map(({ house, dist }) => {
+                const pt = getEffectivePlaceType(house);
+                const badgeLabel = getPlaceBadgeLabel(house);
+                const badgeColor = getPlaceColor(pt, house.shopCategory, house.side);
+                return (
+                  <div key={house.id} className="p-3 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div
+                        style={{ backgroundColor: badgeColor }}
+                        className="w-7 h-7 rounded-lg text-white flex items-center justify-center shrink-0 shadow-xs"
                       >
-                        · {house.side === 'left' ? 'Left' : 'Right'}
-                      </span>
-                      {house.shopName && (
-                        <span className="text-xs font-semibold text-sky-700 dark:text-sky-400">
-                          {' '}
-                          · {house.shopName}
-                        </span>
-                      )}
+                        <PlaceIcon
+                          placeType={pt}
+                          shopCategory={house.shopCategory}
+                          shopName={house.shopName}
+                          className="w-3.5 h-3.5"
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                          <span className="truncate">
+                            {house.shopName?.trim() ||
+                              (pt !== 'house'
+                                ? `${badgeLabel} #${house.houseNumber}`
+                                : `House ${house.houseNumber}`)}
+                          </span>
+                          <span
+                            style={{ backgroundColor: badgeColor }}
+                            className="px-1.5 py-0.5 rounded text-[9px] font-bold text-white shrink-0 leading-none"
+                          >
+                            {badgeLabel}
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                          #{house.houseNumber} ({house.side === 'left' ? 'L' : 'R'}) ·{' '}
+                          {house.roadName} ·{' '}
+                          <span className="font-mono tabular-nums">{formatDistance(dist)}</span>
+                        </div>
+                      </div>
                     </div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                      {house.roadName} ·{' '}
-                      <span className="font-mono tabular-nums">{formatDistance(dist)}</span>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onSelectHouseToNavigate(house)}
+                      className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg inline-flex items-center gap-1 shrink-0 cursor-pointer"
+                    >
+                      <Navigation className="w-3.5 h-3.5" />
+                      Go
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => onSelectHouseToNavigate(house)}
-                    className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg inline-flex items-center gap-1 shrink-0 cursor-pointer"
-                  >
-                    <Navigation className="w-3.5 h-3.5" />
-                    Go
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

@@ -36,15 +36,27 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  HouseSide,
   LatLngPoint,
+  PlaceType,
   RoadJunction,
+  ShopCategory,
   VillageHouse,
   VillageRoad,
   VillageRouteResult,
 } from '../types/map.ts';
 import { formatDistance, generateGpxExport, getSurfaceLabel } from '../utils/geo.ts';
+import {
+  PLACE_TYPE_OPTIONS,
+  SHOP_CATEGORY_OPTIONS,
+  getEffectivePlaceType,
+  getPlaceBadgeLabel,
+  getPlaceColor,
+  getPlaceSearchScore,
+} from '../utils/placeMeta.ts';
 import type { AutoMapXSymbolAction } from './AutoMapXWorkspace.tsx';
 import { TurnIcon } from './NavigationPanel.tsx';
+import PlaceIcon from './PlaceIcon.tsx';
 import type { RoadEditorTool } from './VillageMap.tsx';
 
 export interface PreviewRoadEditorAutoMapUi {
@@ -121,6 +133,17 @@ interface SavedDataViewProps {
   onFocusHouse: (house: VillageHouse) => void;
   onMapPendingBranch?: (junction: RoadJunction, branchId: string) => void;
   onFitAll: () => void;
+  onUpdateHouse?: (
+    houseId: string,
+    patch: {
+      houseNumber: string;
+      side: HouseSide;
+      placeType: PlaceType;
+      shopCategory?: ShopCategory;
+      shopName?: string;
+      note?: string;
+    }
+  ) => void;
   onDeleteHouse: (houseId: string) => void;
   onDeleteRoad: (roadId: string) => void;
   onImportBackup: (data: { roads: VillageRoad[]; houses: VillageHouse[] }) => void;
@@ -370,6 +393,7 @@ export default function SavedDataView({
   onFocusHouse,
   onMapPendingBranch,
   onFitAll,
+  onUpdateHouse,
   onDeleteHouse,
   onDeleteRoad,
   onImportBackup,
@@ -379,23 +403,53 @@ export default function SavedDataView({
   const [query, setQuery] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
   const [showSteps, setShowSteps] = useState(false);
+  const [editingHouse, setEditingHouse] = useState<VillageHouse | null>(null);
+  const [editHouseNum, setEditHouseNum] = useState('');
+  const [editSide, setEditSide] = useState<HouseSide>('left');
+  const [editPlaceType, setEditPlaceType] = useState<PlaceType>('house');
+  const [editShopCategory, setEditShopCategory] = useState<ShopCategory>('kirana');
+  const [editShopName, setEditShopName] = useState('');
+  const [editNote, setEditNote] = useState('');
   const fileRef = useRef<HTMLInputElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const openHouseEditor = (h: VillageHouse) => {
+    setEditingHouse(h);
+    setEditHouseNum(h.houseNumber);
+    setEditSide(h.side);
+    setEditPlaceType(getEffectivePlaceType(h));
+    setEditShopCategory(h.shopCategory ?? 'kirana');
+    setEditShopName(h.shopName ?? '');
+    setEditNote(h.note ?? '');
+  };
+
+  const handleSaveEditedHouse = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingHouse || !onUpdateHouse) return;
+    const cleanNum = editHouseNum.trim() || editingHouse.houseNumber;
+    onUpdateHouse(editingHouse.id, {
+      houseNumber: cleanNum,
+      side: editSide,
+      placeType: editPlaceType,
+      shopCategory: editPlaceType === 'shop' ? editShopCategory : undefined,
+      shopName: editShopName.trim() || undefined,
+      note: editNote.trim() || undefined,
+    });
+    setEditingHouse(null);
+  };
 
   const scrollToMap = () => {
     scrollContainerRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   const filteredHouses = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = query.trim();
     if (!q) return houses;
-    return houses.filter(
-      (h) =>
-        h.houseNumber.toLowerCase().includes(q) ||
-        (h.shopName ?? '').toLowerCase().includes(q) ||
-        h.roadName.toLowerCase().includes(q) ||
-        (h.note ?? '').toLowerCase().includes(q)
-    );
+    return houses
+      .map((h) => ({ h, score: getPlaceSearchScore(h, q) }))
+      .filter((entry): entry is { h: VillageHouse; score: number } => entry.score !== null)
+      .sort((a, b) => a.score - b.score)
+      .map((entry) => entry.h);
   }, [houses, query]);
 
   const activeRoute = routeOptions[selectedRouteIndex] ?? routeOptions[0] ?? null;
@@ -1493,17 +1547,17 @@ export default function SavedDataView({
 
         {/* Houses & Roads Lists */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
-          {/* Houses Section */}
+          {/* Houses & Places Section */}
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
             <div className="p-3.5 border-b border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
               <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                House Numbers ({filteredHouses.length})
+                Houses, Shops &amp; Places ({filteredHouses.length})
               </h2>
-              <div className="relative w-full sm:w-56">
+              <div className="relative w-full sm:w-60">
                 <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
-                  placeholder="Filter house no., shop or road..."
+                  placeholder="Filter #no, shop, online, temple..."
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   className="w-full pl-9 pr-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs text-slate-900 dark:text-slate-100"
@@ -1513,37 +1567,59 @@ export default function SavedDataView({
 
             {filteredHouses.length === 0 ? (
               <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400">
-                No saved houses or shops match your filter.
+                No saved houses, shops, or temples match your filter.
               </div>
             ) : (
               <div className="divide-y divide-slate-200 dark:divide-slate-800 max-h-[420px] overflow-y-auto">
                 {filteredHouses.map((h) => {
                   const isA = fromHouseId === h.id;
                   const isB = toHouseId === h.id;
+                  const pt = getEffectivePlaceType(h);
+                  const badgeLabel = getPlaceBadgeLabel(h);
+                  const badgeColor = getPlaceColor(pt, h.shopCategory, h.side);
                   return (
                     <div key={h.id} className="p-3 flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
-                          House {h.houseNumber}{' '}
-                          <span
-                            className={`text-xs font-medium ${
-                              h.side === 'left'
-                                ? 'text-emerald-700 dark:text-emerald-400'
-                                : 'text-amber-700 dark:text-amber-400'
-                            }`}
-                          >
-                            · {h.side === 'left' ? 'Left' : 'Right'}
-                          </span>
-                          {h.shopName && (
-                            <span className="text-xs font-semibold text-sky-700 dark:text-sky-400">
-                              {' '}
-                              · {h.shopName}
-                            </span>
-                          )}
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <div
+                          style={{ backgroundColor: badgeColor }}
+                          className="w-7 h-7 rounded-lg text-white flex items-center justify-center shrink-0 mt-0.5 shadow-xs"
+                          title={badgeLabel}
+                        >
+                          <PlaceIcon
+                            placeType={pt}
+                            shopCategory={h.shopCategory}
+                            shopName={h.shopName}
+                            className="w-3.5 h-3.5"
+                          />
                         </div>
-                        <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums truncate">
-                          {h.roadName}
-                          {h.note ? ` · ${h.note}` : ''}
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-1.5 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                            <span>House {h.houseNumber}</span>
+                            <span
+                              style={{ backgroundColor: badgeColor }}
+                              className="px-1.5 py-0.5 rounded text-[10px] font-bold text-white leading-none"
+                            >
+                              {badgeLabel}
+                            </span>
+                            <span
+                              className={`text-xs font-medium ${
+                                h.side === 'left'
+                                  ? 'text-emerald-700 dark:text-emerald-400'
+                                  : 'text-amber-700 dark:text-amber-400'
+                              }`}
+                            >
+                              · {h.side === 'left' ? 'Left' : 'Right'}
+                            </span>
+                          </div>
+                          {h.shopName && (
+                            <div className="text-xs font-semibold text-sky-700 dark:text-sky-400 truncate">
+                              {h.shopName}
+                            </div>
+                          )}
+                          <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums truncate">
+                            {h.roadName}
+                            {h.note ? ` · ${h.note}` : ''}
+                          </div>
                         </div>
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
@@ -1577,6 +1653,16 @@ export default function SavedDataView({
                         >
                           B
                         </button>
+                        {onUpdateHouse && (
+                          <button
+                            type="button"
+                            onClick={() => openHouseEditor(h)}
+                            title="Edit House, Shop, or Temple category"
+                            className="p-1.5 bg-amber-50 dark:bg-amber-950/60 hover:bg-amber-100 dark:hover:bg-amber-900/60 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 rounded-lg cursor-pointer"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => {
@@ -1714,6 +1800,206 @@ export default function SavedDataView({
           </div>
         </div>
       </div>
+
+      {/* Edit House / Shop / Place Modal */}
+      {editingHouse && (
+        <div className="fixed inset-0 z-[1250] bg-slate-900/65 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <form
+            onSubmit={handleSaveEditedHouse}
+            className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl p-4 sm:p-5 space-y-4 max-h-[90dvh] overflow-y-auto"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div
+                  style={{
+                    backgroundColor: getPlaceColor(
+                      editPlaceType,
+                      editPlaceType === 'shop' ? editShopCategory : undefined,
+                      editSide
+                    ),
+                  }}
+                  className="w-9 h-9 rounded-xl text-white flex items-center justify-center shrink-0 shadow-sm transition-colors"
+                >
+                  <PlaceIcon
+                    placeType={editPlaceType}
+                    shopCategory={editPlaceType === 'shop' ? editShopCategory : undefined}
+                    shopName={editShopName}
+                    className="w-4 h-4"
+                  />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
+                    Edit Place #{editingHouse.houseNumber}
+                  </h3>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                    {editingHouse.roadName} · Icon updates live
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingHouse(null)}
+                className="p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Place Type Selector */}
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+                Place Type (Changes Map Icon)
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                {PLACE_TYPE_OPTIONS.map((opt) => {
+                  const active = editPlaceType === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setEditPlaceType(opt.id)}
+                      style={active ? { backgroundColor: opt.color, borderColor: opt.color } : undefined}
+                      className={`px-2.5 py-2 rounded-xl border text-[11px] font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                        active
+                          ? 'text-white shadow-xs'
+                          : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      <PlaceIcon placeType={opt.id} className="w-3.5 h-3.5 shrink-0" />
+                      <span className="truncate">{opt.shortLabel}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Shop Sub-Category Selector */}
+            {editPlaceType === 'shop' && (
+              <div className="space-y-1.5 p-3 rounded-xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/70">
+                <label className="block text-xs font-semibold text-emerald-900 dark:text-emerald-200">
+                  Shop Category
+                </label>
+                <div className="flex flex-wrap gap-1.5">
+                  {SHOP_CATEGORY_OPTIONS.map((cat) => {
+                    const active = editShopCategory === cat.id;
+                    return (
+                      <button
+                        key={cat.id}
+                        type="button"
+                        onClick={() => setEditShopCategory(cat.id)}
+                        style={active ? { backgroundColor: cat.color, borderColor: cat.color } : undefined}
+                        className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer transition-colors ${
+                          active
+                            ? 'text-white shadow-xs'
+                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                        }`}
+                      >
+                        <PlaceIcon
+                          placeType="shop"
+                          shopCategory={cat.id}
+                          className="w-3 h-3 shrink-0"
+                        />
+                        <span>{cat.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  House / Ref Number
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editHouseNum}
+                  onChange={(e) => setEditHouseNum(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-sm font-mono font-bold text-slate-900 dark:text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Road Side
+                </label>
+                <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+                  {(['left', 'right'] as const).map((sideVal) => (
+                    <button
+                      key={sideVal}
+                      type="button"
+                      onClick={() => setEditSide(sideVal)}
+                      className={`py-1.5 rounded-lg text-xs font-bold cursor-pointer ${
+                        editSide === sideVal
+                          ? sideVal === 'left'
+                            ? 'bg-emerald-700 text-white'
+                            : 'bg-amber-600 text-white'
+                          : 'text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      {sideVal === 'left' ? 'Left' : 'Right'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                {editPlaceType === 'house' ? 'Family / Shop Name (optional)' : 'Place / Shop Name'}
+              </label>
+              <input
+                type="text"
+                value={editShopName}
+                onChange={(e) => setEditShopName(e.target.value)}
+                placeholder={
+                  editPlaceType === 'temple'
+                    ? 'e.g. Hanuman Mandir...'
+                    : editPlaceType === 'school'
+                    ? 'e.g. Govt Primary School...'
+                    : editPlaceType === 'shop' && editShopCategory === 'online'
+                    ? 'e.g. Tiwari CSC / Online Center...'
+                    : editPlaceType === 'shop'
+                    ? 'e.g. Ram Kirana Store...'
+                    : 'Optional name...'
+                }
+                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-900 dark:text-slate-100"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                Landmark Note (optional)
+              </label>
+              <input
+                type="text"
+                value={editNote}
+                onChange={(e) => setEditNote(e.target.value)}
+                placeholder="Near chowk, well, gate..."
+                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-900 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setEditingHouse(null)}
+                className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl inline-flex items-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <Check className="w-4 h-4" />
+                Save Changes
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

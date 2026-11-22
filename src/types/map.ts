@@ -35,6 +35,24 @@ export interface RoadJunction {
   branches?: JunctionBranch[];
 }
 
+export type PlaceType =
+  | 'house'
+  | 'shop'
+  | 'temple'
+  | 'school'
+  | 'clinic'
+  | 'masjid'
+  | 'landmark';
+
+export type ShopCategory =
+  | 'kirana'
+  | 'online'
+  | 'medical'
+  | 'hardware'
+  | 'tea_snacks'
+  | 'tailor'
+  | 'general';
+
 export interface VillageHouse {
   id: string;
   houseNumber: string;
@@ -49,6 +67,8 @@ export interface VillageHouse {
   roadName: string;
   villageName: string;
   segmentIndex?: number;
+  placeType?: PlaceType;
+  shopCategory?: ShopCategory;
   shopName?: string;
   note?: string;
   createdAt: string;

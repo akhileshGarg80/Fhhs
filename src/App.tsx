@@ -34,6 +34,7 @@ import AutoMapXWorkspace, {
 } from './components/AutoMapXWorkspace.tsx';
 import AutoWorkspace from './components/AutoWorkspace.tsx';
 import NavigationPanel from './components/NavigationPanel.tsx';
+import PlaceIcon from './components/PlaceIcon.tsx';
 import { PWAInstallButton } from './components/PWAInstallButton.tsx';
 import SavedDataView, { type PreviewRoadEditorUi } from './components/SavedDataView.tsx';
 import VehiclesWorkspace, { type VehicleSimSpeed } from './components/VehiclesWorkspace.tsx';
@@ -54,8 +55,10 @@ import type {
   JunctionDirection,
   JunctionWayCount,
   LatLngPoint,
+  PlaceType,
   RoadJunction,
   SavedSearchArea,
+  ShopCategory,
   TravelMode,
   VehicleSegmentAccess,
   VillageHouse,
@@ -101,6 +104,13 @@ import {
   reverseGeocodeVillage,
   searchPlaceNominatim,
 } from './utils/osmClient.ts';
+import {
+  getEffectivePlaceType,
+  getPlaceBadgeLabel,
+  getPlaceColor,
+  getPlaceSearchScore,
+  isPublicPoi,
+} from './utils/placeMeta.ts';
 import {
   clearLocalStore,
   loadAutoTrips,
@@ -1010,26 +1020,18 @@ export default function App() {
     [roads, draftJunctions]
   );
 
-  // House Number OR Shop / Dukan matching for Navigate Search
+  // House Number OR Shop / Online Shop / Temple / School matching for Navigate Search
   const matchingHouses = useMemo(() => {
-    const q = houseQuery.trim().toLowerCase();
-    if (!q) return houses.slice(0, 8);
+    const q = houseQuery.trim();
+    if (!q) {
+      const pois = houses.filter((h) => isPublicPoi(h));
+      return (pois.length > 0 ? pois : houses).slice(0, 10);
+    }
     return houses
-      .filter((h) => {
-        const num = h.houseNumber.toLowerCase();
-        const shop = (h.shopName ?? '').toLowerCase();
-        const note = (h.note ?? '').toLowerCase();
-        return num.includes(q) || shop.includes(q) || note.includes(q);
-      })
-      .sort((a, b) => {
-        const aNum = a.houseNumber.toLowerCase();
-        const bNum = b.houseNumber.toLowerCase();
-        const aShop = (a.shopName ?? '').toLowerCase();
-        const bShop = (b.shopName ?? '').toLowerCase();
-        const aScore = aNum === q ? 0 : aShop.startsWith(q) ? 1 : aNum.startsWith(q) ? 2 : 3;
-        const bScore = bNum === q ? 0 : bShop.startsWith(q) ? 1 : bNum.startsWith(q) ? 2 : 3;
-        return aScore - bScore;
-      });
+      .map((h) => ({ h, score: getPlaceSearchScore(h, q) }))
+      .filter((entry): entry is { h: VillageHouse; score: number } => entry.score !== null)
+      .sort((a, b) => a.score - b.score)
+      .map((entry) => entry.h);
   }, [houses, houseQuery]);
 
   // Compute all distinct saved-road routes from navOrigin to target House for active travelMode
@@ -2103,7 +2105,9 @@ export default function App() {
     houseNumber: string,
     side: HouseSide,
     shopName?: string,
-    note?: string
+    note?: string,
+    placeType?: PlaceType,
+    shopCategory?: ShopCategory
   ) => {
     const activeSegIdx = Math.max(0, walkSegments.length - 1);
     const activeSeg = walkSegments[activeSegIdx] ?? [];
@@ -2126,9 +2130,13 @@ export default function App() {
       });
     }
 
+    const resolvedType: PlaceType =
+      placeType ?? (shopCategory || shopName?.trim() ? 'shop' : 'house');
     const newHouse: VillageHouse = {
       id: `house-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       houseNumber,
+      placeType: resolvedType,
+      shopCategory: resolvedType === 'shop' ? shopCategory : undefined,
       shopName,
       side,
       lat: visual.lat,
@@ -2532,16 +2540,22 @@ export default function App() {
       houseNumber: string,
       side: HouseSide,
       shopName?: string,
-      note?: string
+      note?: string,
+      placeType?: PlaceType,
+      shopCategory?: ShopCategory
     ) => {
       const trip = autoTrips.find((t) => t.id === tripId);
       if (!trip) return;
       const sideBearing = side === 'left' ? (headingDeg + 270) % 360 : (headingDeg + 90) % 360;
       const visual = offsetCoord(point, sideBearing, 7);
+      const resolvedType: PlaceType =
+        placeType ?? (shopCategory || shopName?.trim() ? 'shop' : 'house');
 
       const newHouse: VillageHouse = {
         id: `house-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         houseNumber,
+        placeType: resolvedType,
+        shopCategory: resolvedType === 'shop' ? shopCategory : undefined,
         shopName,
         side,
         lat: visual.lat,
@@ -2922,13 +2936,23 @@ export default function App() {
   }, [handleAmxCommitRewind]);
 
   const handleAmxAddHouse = useCallback(
-    (houseNumber: string, side: HouseSide, shopName?: string) => {
+    (
+      houseNumber: string,
+      side: HouseSide,
+      shopName?: string,
+      placeType?: PlaceType,
+      shopCategory?: ShopCategory
+    ) => {
       const cur = amxCursorRef.current;
       const sideBearing = side === 'left' ? (cur.headingDeg + 270) % 360 : (cur.headingDeg + 90) % 360;
       const visual = offsetCoord(cur, sideBearing, 7);
+      const resolvedType: PlaceType =
+        placeType ?? (shopCategory || shopName?.trim() ? 'shop' : 'house');
       const newHouse: VillageHouse = {
         id: `house-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         houseNumber,
+        placeType: resolvedType,
+        shopCategory: resolvedType === 'shop' ? shopCategory : undefined,
         shopName,
         side,
         lat: visual.lat,
@@ -3128,16 +3152,22 @@ export default function App() {
       houseNumber: string,
       side: HouseSide,
       shopName?: string,
-      note?: string
+      note?: string,
+      placeType?: PlaceType,
+      shopCategory?: ShopCategory
     ) => {
       const road = roads.find((r) => r.id === roadId);
       if (!road) return;
       const sideBearing = side === 'left' ? (headingDeg + 270) % 360 : (headingDeg + 90) % 360;
       const visual = offsetCoord(point, sideBearing, 7);
+      const resolvedType: PlaceType =
+        placeType ?? (shopCategory || shopName?.trim() ? 'shop' : 'house');
 
       const newHouse: VillageHouse = {
         id: `house-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         houseNumber,
+        placeType: resolvedType,
+        shopCategory: resolvedType === 'shop' ? shopCategory : undefined,
         shopName,
         side,
         lat: visual.lat,
@@ -3175,6 +3205,43 @@ export default function App() {
       }))
     );
   }, []);
+
+  const handleUpdateHouse = useCallback(
+    (
+      houseId: string,
+      patch: {
+        houseNumber: string;
+        side: HouseSide;
+        placeType: PlaceType;
+        shopCategory?: ShopCategory;
+        shopName?: string;
+        note?: string;
+      }
+    ) => {
+      const applyPatch = (h: VillageHouse): VillageHouse => ({
+        ...h,
+        houseNumber: patch.houseNumber,
+        side: patch.side,
+        placeType: patch.placeType,
+        shopCategory: patch.placeType === 'shop' ? patch.shopCategory : undefined,
+        shopName: patch.shopName,
+        note: patch.note,
+      });
+      setHouses((prev) => {
+        const nextHouses = prev.map((h) => (h.id === houseId ? applyPatch(h) : h));
+        saveLocalStore({ roads: roadsTourRef.current, houses: nextHouses });
+        return nextHouses;
+      });
+      setAutoTrips((prev) =>
+        prev.map((t) => ({
+          ...t,
+          houses: t.houses.map((h) => (h.id === houseId ? applyPatch(h) : h)),
+        }))
+      );
+      setTargetHouse((prev) => (prev && prev.id === houseId ? applyPatch(prev) : prev));
+    },
+    []
+  );
 
   // Live Mid-Segment Snap indicators & 1-tap Touch Old Road helpers for Add & AutoMapX
   const walkActiveTip = useMemo(() => {
@@ -4190,6 +4257,7 @@ export default function App() {
       targetHouse={mode === 'add' ? null : targetHouse}
       darkMode={theme === 'dark'}
       isolateNavigation={isolateNavigation}
+      publicPoiOnly={accessRole === 'public' && mode === 'navigate'}
       activeInstruction={mode === 'add' ? null : activeNavInstruction}
       distanceToNextTurnMeters={mode === 'add' ? null : distanceToNextTurnMeters}
       interactionMode={interactionMode}
@@ -4339,10 +4407,12 @@ export default function App() {
         if (target.segmentAccess?.[segIndex] === access && target.roadRole) {
           return prev;
         }
-        return stampRoadSegmentAccess(prev, roadId, segIndex, access);
+        const next = stampRoadSegmentAccess(prev, roadId, segIndex, access);
+        saveLocalStore({ roads: next, houses });
+        return next;
       });
     },
-    []
+    [houses]
   );
 
   // Stop vehicle playback if leaving vehicles mode
@@ -4485,17 +4555,27 @@ export default function App() {
     if (vehStrokeChangedRef.current && vehPreStrokeRef.current) {
       const snap = vehPreStrokeRef.current;
       setVehBrushHistory((h) => [...h.slice(-19), snap]);
+      saveLocalStore({ roads: roadsTourRef.current, houses });
     }
     vehPreStrokeRef.current = null;
     vehStrokeChangedRef.current = false;
-  }, []);
+  }, [houses]);
 
   const handleVehUndo = useCallback(() => {
     if (vehBrushHistory.length === 0) return;
     const prevSnap = vehBrushHistory[vehBrushHistory.length - 1];
     setVehBrushHistory((h) => h.slice(0, -1));
     setRoads(prevSnap);
-  }, [vehBrushHistory]);
+    saveLocalStore({ roads: prevSnap, houses });
+  }, [vehBrushHistory, houses]);
+
+  const handleSaveVehicleData = useCallback(() => {
+    setRoads((prev) => {
+      const next = classifyVillageRoadHierarchy(prev);
+      saveLocalStore({ roads: next, houses });
+      return next;
+    });
+  }, [houses]);
 
   const activeVehWp =
     vehTourWaypoints.length > 0
@@ -4953,7 +5033,11 @@ export default function App() {
               onUndo={handleVehUndo}
               onMarkRestNoCar={() => {
                 setVehBrushHistory((h) => [...h.slice(-19), cloneRoadsSnapshot(roads)]);
-                setRoads((prev) => markRemainingUnmarkedAsNoCar(prev));
+                setRoads((prev) => {
+                  const next = markRemainingUnmarkedAsNoCar(prev);
+                  saveLocalStore({ roads: next, houses });
+                  return next;
+                });
               }}
               waypoints={vehTourWaypoints}
               currentIdx={vehIdx}
@@ -4996,19 +5080,27 @@ export default function App() {
               onNextRoad={() => handleVehPrevNextRoad(1)}
               onStampWholeRoad={(roadId, access) => {
                 setVehBrushHistory((h) => [...h.slice(-19), cloneRoadsSnapshot(roads)]);
-                setRoads((prev) => stampRoadSegmentAccess(prev, roadId, 'all', access));
+                setRoads((prev) => {
+                  const next = stampRoadSegmentAccess(prev, roadId, 'all', access);
+                  saveLocalStore({ roads: next, houses });
+                  return next;
+                });
               }}
               onResetAllMarks={() => {
                 setVehIsPlaying(false);
                 setVehBrushHistory((h) => [...h.slice(-19), cloneRoadsSnapshot(roads)]);
-                setRoads((prev) =>
-                  classifyVillageRoadHierarchy(
+                setRoads((prev) => {
+                  const next = classifyVillageRoadHierarchy(
                     prev.map((r) => ({ ...r, segmentAccess: undefined, roadRole: 'unmarked' }))
-                  )
-                );
+                  );
+                  saveLocalStore({ roads: next, houses });
+                  return next;
+                });
               }}
+              onSaveVehicleData={handleSaveVehicleData}
               onFitAllRoads={() => handleFitAllRoadsOnly()}
               onOpenCleanMap={() => {
+                handleSaveVehicleData();
                 setVehIsPlaying(false);
                 setMapCleanScreen(false);
                 setMode('map');
@@ -5066,6 +5158,7 @@ export default function App() {
                 })
               }
               onFitAll={() => handleFitAllSaved()}
+              onUpdateHouse={handleUpdateHouse}
               onDeleteHouse={(id) => {
                 setHouses((prev) => prev.filter((h) => h.id !== id));
                 setAutoTrips((prev) =>
@@ -5383,7 +5476,7 @@ export default function App() {
                     <Store className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-400 ml-2 shrink-0" />
                     <input
                       type="text"
-                      placeholder="House or Shop..."
+                      placeholder="House, Shop, Temple..."
                       value={houseQuery}
                       onFocus={() => setHouseDropdownOpen(true)}
                       onBlur={() => setTimeout(() => setHouseDropdownOpen(false), 180)}
@@ -5402,30 +5495,49 @@ export default function App() {
                   </form>
 
                   {houseDropdownOpen && matchingHouses.length > 0 && (
-                    <div className="absolute right-0 w-64 sm:w-72 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-lg divide-y divide-slate-100 dark:divide-slate-800 max-h-60 overflow-y-auto z-50">
-                      {matchingHouses.map((h) => (
-                        <button
-                          key={h.id}
-                          type="button"
-                          onMouseDown={() => startNavigateToHouse(h)}
-                          className="w-full px-3 py-2 text-left text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/60 flex items-center justify-between gap-2 cursor-pointer"
-                        >
-                          <div className="min-w-0">
-                            <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
-                              House <span className="font-mono">{h.houseNumber}</span>
-                              {h.shopName && (
-                                <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
-                                  {' '}
-                                  · {h.shopName}
-                                </span>
-                              )}
+                    <div className="absolute right-0 w-72 sm:w-80 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-lg divide-y divide-slate-100 dark:divide-slate-800 max-h-64 overflow-y-auto z-50">
+                      {matchingHouses.map((h) => {
+                        const pt = getEffectivePlaceType(h);
+                        const badgeLabel = getPlaceBadgeLabel(h);
+                        const badgeColor = getPlaceColor(pt, h.shopCategory, h.side);
+                        return (
+                          <button
+                            key={h.id}
+                            type="button"
+                            onMouseDown={() => startNavigateToHouse(h)}
+                            className="w-full px-3 py-2 text-left text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/60 flex items-center justify-between gap-2 cursor-pointer"
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span
+                                style={{ backgroundColor: badgeColor }}
+                                className="w-6 h-6 rounded-md text-white flex items-center justify-center shrink-0"
+                              >
+                                <PlaceIcon
+                                  placeType={pt}
+                                  shopCategory={h.shopCategory}
+                                  shopName={h.shopName}
+                                  className="w-3.5 h-3.5"
+                                />
+                              </span>
+                              <div className="min-w-0">
+                                <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
+                                  {h.shopName?.trim() ||
+                                    (pt !== 'house' ? `${badgeLabel} #${h.houseNumber}` : `House ${h.houseNumber}`)}
+                                </div>
+                                <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                                  #{h.houseNumber} · {h.roadName}
+                                </div>
+                              </div>
                             </div>
-                          </div>
-                          <span className="text-slate-500 dark:text-slate-400 shrink-0 text-[11px]">
-                            {h.side === 'left' ? 'Left' : 'Right'} · {h.roadName}
-                          </span>
-                        </button>
-                      ))}
+                            <span
+                              style={{ backgroundColor: badgeColor }}
+                              className="px-1.5 py-0.5 rounded text-[9px] font-bold text-white shrink-0"
+                            >
+                              {badgeLabel}
+                            </span>
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -5527,9 +5639,7 @@ export default function App() {
                   >
                     <span className="truncate pr-2">
                       {targetHouse
-                        ? `House ${targetHouse.houseNumber}${
-                            targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
-                          }${
+                        ? `${targetHouse.shopName?.trim() || `House ${targetHouse.houseNumber}`}${
                             navRouteResult?.reachable
                               ? ` · ${formatDistance(
                                   liveProgress
@@ -5538,6 +5648,8 @@ export default function App() {
                                 )}`
                               : ''
                           }`
+                        : accessRole === 'public'
+                        ? `Roads & Places (${houses.filter((h) => isPublicPoi(h)).length} POIs · Search any House)`
                         : `Select a House or Shop (${houses.length}) to Track`}
                     </span>
                     {mobileSheetOpen ? (

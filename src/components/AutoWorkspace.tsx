@@ -25,6 +25,8 @@ import type {
   AutoTrip,
   HouseSide,
   LatLngPoint,
+  PlaceType,
+  ShopCategory,
   VillageHouse,
   VillageRoad,
 } from '../types/map.ts';
@@ -36,6 +38,8 @@ import {
   getSurfaceLabel,
 } from '../utils/geo.ts';
 import type { GpsPrecisionMode, GpsQualityReport } from '../utils/gpsFilter.ts';
+import { PLACE_TYPE_OPTIONS, SHOP_CATEGORY_OPTIONS } from '../utils/placeMeta.ts';
+import PlaceIcon from './PlaceIcon.tsx';
 
 type SimSpeed = 0.5 | 1 | 2 | 4;
 
@@ -74,7 +78,9 @@ interface AutoWorkspaceProps {
     houseNumber: string,
     side: HouseSide,
     shopName?: string,
-    note?: string
+    note?: string,
+    placeType?: PlaceType,
+    shopCategory?: ShopCategory
   ) => void;
   onRemoveHouseOnTrip: (tripId: string, houseId: string) => void;
   onFocusHouse: (house: VillageHouse) => void;
@@ -159,6 +165,8 @@ export default function AutoWorkspace({
 
   const [tripNameDraft, setTripNameDraft] = useState('');
   const [houseInput, setHouseInput] = useState(nextSuggestedHouse || '1');
+  const [placeType, setPlaceType] = useState<PlaceType>('house');
+  const [shopCategory, setShopCategory] = useState<ShopCategory>('kirana');
   const [shopName, setShopName] = useState('');
   const [houseNote, setHouseNote] = useState('');
   const [showNoteField, setShowNoteField] = useState(false);
@@ -285,6 +293,8 @@ export default function AutoWorkspace({
     if (!selectedTrip || !activeWaypoint) return;
     const trimmed = houseInput.trim();
     if (!trimmed) return;
+    const effectiveType: PlaceType =
+      placeType === 'house' && shopName.trim() ? 'shop' : placeType;
 
     onAddHouseOnTrip(
       selectedTrip.id,
@@ -293,7 +303,9 @@ export default function AutoWorkspace({
       trimmed,
       side,
       shopName.trim() || undefined,
-      houseNote.trim() || undefined
+      houseNote.trim() || undefined,
+      effectiveType,
+      effectiveType === 'shop' ? shopCategory : undefined
     );
 
     const parsed = parseInt(trimmed, 10);
@@ -302,6 +314,9 @@ export default function AutoWorkspace({
     }
     setShopName('');
     setHouseNote('');
+    if (effectiveType !== 'house') {
+      setPlaceType('house');
+    }
   };
 
   const commitTripName = () => {
@@ -851,6 +866,52 @@ export default function AutoWorkspace({
                   </button>
                 </div>
               </div>
+
+              <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5">
+                {PLACE_TYPE_OPTIONS.map((opt) => {
+                  const active = placeType === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setPlaceType(opt.id)}
+                      style={active ? { backgroundColor: opt.color, borderColor: opt.color } : undefined}
+                      className={`px-2 py-1 rounded-lg border text-[10px] font-bold inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors ${
+                        active
+                          ? 'text-white shadow-xs'
+                          : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      <PlaceIcon placeType={opt.id} className="w-3 h-3 shrink-0" />
+                      <span>{opt.shortLabel}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {placeType === 'shop' && (
+                <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5">
+                  {SHOP_CATEGORY_OPTIONS.map((cat) => {
+                    const active = shopCategory === cat.id;
+                    return (
+                      <button
+                        key={cat.id}
+                        type="button"
+                        onClick={() => setShopCategory(cat.id)}
+                        style={active ? { backgroundColor: cat.color, borderColor: cat.color } : undefined}
+                        className={`px-2 py-1 rounded-lg border text-[10px] font-bold inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors ${
+                          active
+                            ? 'text-white shadow-xs'
+                            : 'bg-emerald-50/70 dark:bg-slate-800 border-emerald-200 dark:border-slate-700 text-emerald-900 dark:text-slate-300'
+                        }`}
+                      >
+                        <PlaceIcon placeType="shop" shopCategory={cat.id} className="w-3 h-3 shrink-0" />
+                        <span>{cat.shortLabel}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
 
               {showNoteField && (
                 <div className="flex items-center gap-1.5">

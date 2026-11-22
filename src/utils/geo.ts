@@ -897,16 +897,25 @@ function extractCarAccessibleRoads(roads: VillageRoad[]): VillageRoad[] {
     if (road.points.length < 2) continue;
     const segCount = road.points.length - 1;
     const access = road.segmentAccess;
-    if (!access || access.length !== segCount) continue;
+    const roleIsCar = road.roadRole === 'main' || road.roadRole === 'car_street';
+    if ((!access || access.length === 0) && !roleIsCar) continue;
+
+    const isSegCar = (idx: number): boolean => {
+      if (access && access.length > 0) {
+        if (idx < access.length) return access[idx] === 'car';
+        return access[access.length - 1] === 'car';
+      }
+      return roleIsCar;
+    };
 
     let i = 0;
     while (i < segCount) {
-      if (access[i] !== 'car') {
+      if (!isSegCar(i)) {
         i++;
         continue;
       }
       const startIdx = i;
-      while (i + 1 < segCount && access[i + 1] === 'car') {
+      while (i + 1 < segCount && isSegCar(i + 1)) {
         i++;
       }
       const endIdx = i;
@@ -985,12 +994,17 @@ export function findRoutesToHouse(
       }
 
       const carEnd = route.polyline[route.polyline.length - 1];
+      const safePolyline =
+        route.polyline.length === 1
+          ? [{ lat: start.lat, lng: start.lng }, carEnd]
+          : route.polyline;
       const gapToHouseRoad = haversineMeters(carEnd, targetRoadAnchor);
       const isPartial = gapToHouseRoad > 12;
 
       if (!isPartial) {
         return {
           ...route,
+          polyline: safePolyline,
           travelMode: 'car',
           carPartialStop: false,
         };
@@ -1015,6 +1029,7 @@ export function findRoutesToHouse(
 
       return {
         ...route,
+        polyline: safePolyline,
         travelMode: 'car',
         carPartialStop: true,
         carStopPoint: carEnd,
