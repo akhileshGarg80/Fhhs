@@ -1,8 +1,16 @@
-import type { AutoTrip, SavedSearchArea, VillageHouse, VillageRoad } from '../types/map.ts';
+import type {
+  AutoTrip,
+  LatLngPoint,
+  SavedSearchArea,
+  VehicleSegmentAccess,
+  VillageHouse,
+  VillageRoad,
+} from '../types/map.ts';
 import { calculateBearing, offsetCoord } from './geo.ts';
 
 const STORAGE_KEY = 'grampath_house_mapper_v2';
 const AUTO_TRIPS_KEY = 'grampath_auto_trips_v1';
+const AUTO_DRAFT_KEY = 'grampath_auto_draft_v1';
 const SAVED_AREAS_KEY = 'grampath_saved_areas_v1';
 
 export interface LocalHouseStore {
@@ -175,6 +183,59 @@ export function saveSavedAreas(areas: SavedSearchArea[]): void {
     localStorage.setItem(SAVED_AREAS_KEY, JSON.stringify(areas));
   } catch {
     // ignore quota errors
+  }
+}
+
+export interface AutoDraftState {
+  isRecording: boolean;
+  isPaused: boolean;
+  points: LatLngPoint[];
+  segmentAccess: VehicleSegmentAccess[];
+  carOn: boolean;
+  elapsedSeconds: number;
+  startedAt: string;
+}
+
+export function loadAutoDraft(): AutoDraftState | null {
+  try {
+    const raw = localStorage.getItem(AUTO_DRAFT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<AutoDraftState>;
+    if (!parsed.isRecording || !Array.isArray(parsed.points)) return null;
+    const pts = parsed.points;
+    const segs = Array.isArray(parsed.segmentAccess)
+      ? parsed.segmentAccess.slice(0, Math.max(0, pts.length - 1))
+      : [];
+    while (segs.length < Math.max(0, pts.length - 1)) {
+      segs.push(parsed.carOn === false ? 'no_car' : 'car');
+    }
+    return {
+      isRecording: true,
+      isPaused: Boolean(parsed.isPaused),
+      points: pts,
+      segmentAccess: segs,
+      carOn: parsed.carOn !== false,
+      elapsedSeconds: typeof parsed.elapsedSeconds === 'number' ? parsed.elapsedSeconds : 0,
+      startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveAutoDraft(draft: AutoDraftState): void {
+  try {
+    localStorage.setItem(AUTO_DRAFT_KEY, JSON.stringify(draft));
+  } catch {
+    // ignore quota errors
+  }
+}
+
+export function clearAutoDraft(): void {
+  try {
+    localStorage.removeItem(AUTO_DRAFT_KEY);
+  } catch {
+    // ignore errors
   }
 }
 

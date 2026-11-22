@@ -37,6 +37,7 @@ import NavigationPanel from './components/NavigationPanel.tsx';
 import PlaceIcon from './components/PlaceIcon.tsx';
 import { PWAInstallButton } from './components/PWAInstallButton.tsx';
 import SavedDataView, { type PreviewRoadEditorUi } from './components/SavedDataView.tsx';
+import SimulationWorkspace from './components/SimulationWorkspace.tsx';
 import VehiclesWorkspace, { type VehicleSimSpeed } from './components/VehiclesWorkspace.tsx';
 import VillageMap, {
   type AutoMapXOverlay,
@@ -112,10 +113,13 @@ import {
   isPublicPoi,
 } from './utils/placeMeta.ts';
 import {
+  clearAutoDraft,
   clearLocalStore,
+  loadAutoDraft,
   loadAutoTrips,
   loadLocalStore,
   loadSavedAreas,
+  saveAutoDraft,
   saveAutoTrips,
   saveLocalStore,
   saveSavedAreas,
@@ -128,6 +132,7 @@ type WorkspaceMode =
   | 'add'
   | 'automapx'
   | 'auto'
+  | 'simulation'
   | 'preview'
   | 'map'
   | 'vehicles';
@@ -390,12 +395,29 @@ export default function App() {
   });
   recordingStateRef.current = { isRecording, isPaused, gpsPrecisionMode, captureMode };
 
-  // Auto Trip Recording & Slow At-Home Simulator State
-  const [isAutoRecording, setIsAutoRecording] = useState(false);
-  const [isAutoPaused, setIsAutoPaused] = useState(false);
-  const [autoPoints, setAutoPoints] = useState<LatLngPoint[]>([]);
-  const [autoElapsedSeconds, setAutoElapsedSeconds] = useState(0);
-  const [autoStartedAt, setAutoStartedAt] = useState<string | null>(null);
+  // Auto Trip Recording & Slow At-Home Simulator State (restored incrementally from localStorage)
+  const [initialAutoDraft] = useState(() => loadAutoDraft());
+  const [isAutoRecording, setIsAutoRecording] = useState(
+    () => Boolean(initialAutoDraft?.isRecording)
+  );
+  const [isAutoPaused, setIsAutoPaused] = useState(
+    () => Boolean(initialAutoDraft?.isPaused)
+  );
+  const [autoPoints, setAutoPoints] = useState<LatLngPoint[]>(
+    () => initialAutoDraft?.points ?? []
+  );
+  const [autoSegmentAccess, setAutoSegmentAccess] = useState<VehicleSegmentAccess[]>(
+    () => initialAutoDraft?.segmentAccess ?? []
+  );
+  const [autoCarOn, setAutoCarOn] = useState<boolean>(
+    () => initialAutoDraft?.carOn ?? true
+  );
+  const [autoElapsedSeconds, setAutoElapsedSeconds] = useState(
+    () => initialAutoDraft?.elapsedSeconds ?? 0
+  );
+  const [autoStartedAt, setAutoStartedAt] = useState<string | null>(
+    () => initialAutoDraft?.startedAt ?? null
+  );
   const [autoGpsError, setAutoGpsError] = useState<string | null>(null);
   const [autoSimPoint, setAutoSimPoint] = useState<{
     lat: number;
@@ -405,8 +427,19 @@ export default function App() {
   const autoWatchIdRef = useRef<number | null>(null);
   const lastAutoGpsRef = useRef<LatLngPoint | null>(null);
   const lastAcceptedAutoTsRef = useRef<number>(0);
-  const autoStateRef = useRef({ isAutoRecording, isAutoPaused, gpsPrecisionMode });
-  autoStateRef.current = { isAutoRecording, isAutoPaused, gpsPrecisionMode };
+  const autoPointsRef = useRef<LatLngPoint[]>(autoPoints);
+  autoPointsRef.current = autoPoints;
+  const autoSegmentAccessRef = useRef<VehicleSegmentAccess[]>(autoSegmentAccess);
+  autoSegmentAccessRef.current = autoSegmentAccess;
+  const autoCarOnRef = useRef<boolean>(autoCarOn);
+  autoCarOnRef.current = autoCarOn;
+  const autoStateRef = useRef({
+    isAutoRecording,
+    isAutoPaused,
+    gpsPrecisionMode,
+    autoCarOn,
+  });
+  autoStateRef.current = { isAutoRecording, isAutoPaused, gpsPrecisionMode, autoCarOn };
 
   // AutoMapX Virtual GPS Path Mapper State (start anywhere on map or live GPS, control speed, turns & rewind)
   const [amxCursor, setAmxCursor] = useState<{ lat: number; lng: number; headingDeg: number }>({
@@ -450,6 +483,13 @@ export default function App() {
 
   // Clean Roads-Only Map Mode + Village Vehicles Access Simulator & Pencil State
   const [mapCleanScreen, setMapCleanScreen] = useState(false);
+  const [simStudioRoadId, setSimStudioRoadId] = useState<string | null>(null);
+  const [simStudioAutoPlaySignal, setSimStudioAutoPlaySignal] = useState<number>(0);
+  const [simStudioCursor, setSimStudioCursor] = useState<{
+    lat: number;
+    lng: number;
+    headingDeg: number;
+  } | null>(null);
   const [vehTool, setVehTool] = useState<VehiclePaintTool>('pencil');
   const [vehBrushAccess, setVehBrushAccess] = useState<VehicleSegmentAccess>('car');
   const [vehBrushRadius, setVehBrushRadius] = useState<number>(16);
@@ -832,12 +872,25 @@ export default function App() {
         lastAcceptedAutoTsRef.current = nowTs;
 
         const minStepMeters = pMode === 'accurate_5m' ? 1.5 : 2.5;
-        setAutoPoints((prev) => {
-          if (prev.length === 0) return [smoothed];
-          const lastPt = prev[prev.length - 1];
-          if (haversineMeters(lastPt, smoothed) < minStepMeters) return prev;
-          return [...prev, smoothed];
-        });
+        const curPts = autoPointsRef.current;
+        if (curPts.length === 0) {
+          const nextPts = [smoothed];
+          autoPointsRef.current = nextPts;
+          autoSegmentAccessRef.current = [];
+          setAutoPoints(nextPts);
+          setAutoSegmentAccess([]);
+        } else {
+          const lastPt = curPts[curPts.length - 1];
+          if (haversineMeters(lastPt, smoothed) >= minStepMeters) {
+            const segAcc: VehicleSegmentAccess = autoCarOnRef.current ? 'car' : 'no_car';
+            const nextPts = [...curPts, smoothed];
+            const nextSegs = [...autoSegmentAccessRef.current, segAcc];
+            autoPointsRef.current = nextPts;
+            autoSegmentAccessRef.current = nextSegs;
+            setAutoPoints(nextPts);
+            setAutoSegmentAccess(nextSegs);
+          }
+        }
       },
       (err) => {
         setAutoGpsError(
@@ -2295,7 +2348,45 @@ export default function App() {
     setGpsError(null);
   };
 
-  // Independent Auto Trip Lifecycle (Start -> Pause/Resume -> Close & Save separate trip -> Simulate at home)
+  // Persist in-progress Auto recording + live Car ON/OFF toggles incrementally so data never gets lost
+  const autoDraftElapsedBucket = Math.floor(autoElapsedSeconds / 5);
+  useEffect(() => {
+    if (!isAutoRecording) {
+      clearAutoDraft();
+      return;
+    }
+    saveAutoDraft({
+      isRecording: true,
+      isPaused: isAutoPaused,
+      points: autoPoints,
+      segmentAccess: autoSegmentAccess,
+      carOn: autoCarOn,
+      elapsedSeconds: autoElapsedSeconds,
+      startedAt: autoStartedAt ?? new Date().toISOString(),
+    });
+  }, [
+    isAutoRecording,
+    isAutoPaused,
+    autoPoints,
+    autoSegmentAccess,
+    autoCarOn,
+    autoStartedAt,
+    autoDraftElapsedBucket,
+  ]);
+
+  const { autoCarMeters, autoNoCarMeters } = useMemo(() => {
+    let carM = 0;
+    let noCarM = 0;
+    for (let i = 1; i < autoPoints.length; i++) {
+      const segLen = haversineMeters(autoPoints[i - 1], autoPoints[i]);
+      const acc = autoSegmentAccess[i - 1] ?? (autoCarOn ? 'car' : 'no_car');
+      if (acc === 'car') carM += segLen;
+      else if (acc === 'no_car') noCarM += segLen;
+    }
+    return { autoCarMeters: carM, autoNoCarMeters: noCarM };
+  }, [autoPoints, autoSegmentAccess, autoCarOn]);
+
+  // Independent Auto Trip Lifecycle (Start -> Pause/Resume -> Close & Save separate trip + Car accessibility)
   const handleStartAutoTrip = () => {
     setMode('auto');
     setTargetHouse(null);
@@ -2314,7 +2405,10 @@ export default function App() {
       accuracy: userLocation.accuracy ?? 3.0,
       timestamp: Date.now(),
     };
+    autoPointsRef.current = [startPt];
+    autoSegmentAccessRef.current = [];
     setAutoPoints([startPt]);
+    setAutoSegmentAccess([]);
     setFocusTarget({
       lat: startPt.lat,
       lng: startPt.lng,
@@ -2328,30 +2422,51 @@ export default function App() {
     setIsAutoPaused((p) => !p);
   };
 
+  const handleToggleAutoCar = () => {
+    setAutoCarOn((prev) => {
+      const next = !prev;
+      autoCarOnRef.current = next;
+      return next;
+    });
+  };
+
   const handleTestStepAuto = () => {
     const h = userHeadingDeg ?? 15;
-    setAutoPoints((prev) => {
-      const last = prev[prev.length - 1] ?? userLocation;
-      const stepped = offsetCoord(last, h, 6);
-      const nextPt: LatLngPoint = {
-        lat: stepped.lat,
-        lng: stepped.lng,
-        accuracy: 2.0,
-        timestamp: Date.now(),
-      };
-      setUserLocation(nextPt);
-      if (autoFollowGpsRef.current) {
-        setFocusTarget({ lat: nextPt.lat, lng: nextPt.lng, key: Date.now() });
-      }
-      return prev.length === 0 ? [userLocation, nextPt] : [...prev, nextPt];
-    });
+    const prev = autoPointsRef.current;
+    const last = prev[prev.length - 1] ?? userLocation;
+    const stepped = offsetCoord(last, h, 6);
+    const nextPt: LatLngPoint = {
+      lat: stepped.lat,
+      lng: stepped.lng,
+      accuracy: 2.0,
+      timestamp: Date.now(),
+    };
+    setUserLocation(nextPt);
+    if (autoFollowGpsRef.current) {
+      setFocusTarget({ lat: nextPt.lat, lng: nextPt.lng, key: Date.now() });
+    }
+    const segAcc: VehicleSegmentAccess = autoCarOnRef.current ? 'car' : 'no_car';
+    const nextPts = prev.length === 0 ? [userLocation, nextPt] : [...prev, nextPt];
+    const nextSegs =
+      prev.length === 0 ? [segAcc] : [...autoSegmentAccessRef.current, segAcc];
+    autoPointsRef.current = nextPts;
+    autoSegmentAccessRef.current = nextSegs;
+    setAutoPoints(nextPts);
+    setAutoSegmentAccess(nextSegs);
   };
 
   const handleCloseAndSaveAutoTrip = () => {
     const cleanPoints: LatLngPoint[] = [];
-    for (const pt of autoPoints) {
-      if (cleanPoints.length === 0 || haversineMeters(cleanPoints[cleanPoints.length - 1], pt) >= 0.4) {
+    const cleanSegmentAccess: VehicleSegmentAccess[] = [];
+    for (let i = 0; i < autoPoints.length; i++) {
+      const pt = autoPoints[i];
+      if (cleanPoints.length === 0) {
         cleanPoints.push(pt);
+      } else if (haversineMeters(cleanPoints[cleanPoints.length - 1], pt) >= 0.4) {
+        cleanPoints.push(pt);
+        cleanSegmentAccess.push(
+          autoSegmentAccess[i - 1] ?? (autoCarOn ? 'car' : 'no_car')
+        );
       }
     }
     if (cleanPoints.length < 2) {
@@ -2372,6 +2487,7 @@ export default function App() {
       villageName: detectedVillage,
       surface: 'concrete',
       points: cleanPoints,
+      segmentAccess: cleanSegmentAccess,
       distanceMeters: dist,
       durationSeconds: autoElapsedSeconds,
       captureMode: 'gps_walk',
@@ -2384,43 +2500,61 @@ export default function App() {
       null
     );
     const savedRoad = linkedNewRoads[0];
+    const nextClassifiedRoads = classifyVillageRoadHierarchy([
+      savedRoad,
+      ...updatedExistingRoads,
+    ]);
+    const finalSavedRoad =
+      nextClassifiedRoads.find((r) => r.id === savedRoad.id) ?? savedRoad;
 
     const newTrip: AutoTrip = {
       id: tripId,
       name: tripName,
       villageName: detectedVillage,
       surface: 'concrete',
-      points: savedRoad.points,
-      distanceMeters: savedRoad.distanceMeters,
+      points: finalSavedRoad.points,
+      distanceMeters: finalSavedRoad.distanceMeters,
       durationSeconds: autoElapsedSeconds,
       startedAt: autoStartedAt ?? nowIso,
       endedAt: nowIso,
-      linkedRoadId: savedRoad.id,
+      linkedRoadId: finalSavedRoad.id,
+      segmentAccess: finalSavedRoad.segmentAccess ?? cleanSegmentAccess,
       houses: [],
     };
 
-    setRoads([savedRoad, ...updatedExistingRoads]);
-    setAutoTrips((prev) => [newTrip, ...prev]);
+    const nextTrips = [newTrip, ...autoTrips];
+    setRoads(nextClassifiedRoads);
+    saveLocalStore({ roads: nextClassifiedRoads, houses });
+    setAutoTrips(nextTrips);
+    saveAutoTrips(nextTrips);
+    clearAutoDraft();
     setSelectedAutoTripId(newTrip.id);
     setIsAutoRecording(false);
     setIsAutoPaused(false);
+    autoPointsRef.current = [];
+    autoSegmentAccessRef.current = [];
     setAutoPoints([]);
+    setAutoSegmentAccess([]);
     setAutoElapsedSeconds(0);
     setAutoStartedAt(null);
     setAutoGpsError(null);
     setFocusTarget({
-      lat: savedRoad.points[0].lat,
-      lng: savedRoad.points[0].lng,
-      boundsPoints: savedRoad.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+      lat: finalSavedRoad.points[0].lat,
+      lng: finalSavedRoad.points[0].lng,
+      boundsPoints: finalSavedRoad.points.map((p) => ({ lat: p.lat, lng: p.lng })),
       key: Date.now(),
     });
-    showToast(`Saved "${tripName}" (${formatDistance(savedRoad.distanceMeters)}). Tap Play Sim anytime!`);
+    showToast(`Saved "${tripName}" (${formatDistance(finalSavedRoad.distanceMeters)}).`);
   };
 
   const handleDiscardAutoTrip = () => {
+    clearAutoDraft();
     setIsAutoRecording(false);
     setIsAutoPaused(false);
+    autoPointsRef.current = [];
+    autoSegmentAccessRef.current = [];
     setAutoPoints([]);
+    setAutoSegmentAccess([]);
     setAutoElapsedSeconds(0);
     setAutoStartedAt(null);
     setAutoGpsError(null);
@@ -3218,15 +3352,20 @@ export default function App() {
         note?: string;
       }
     ) => {
-      const applyPatch = (h: VillageHouse): VillageHouse => ({
-        ...h,
-        houseNumber: patch.houseNumber,
-        side: patch.side,
-        placeType: patch.placeType,
-        shopCategory: patch.placeType === 'shop' ? patch.shopCategory : undefined,
-        shopName: patch.shopName,
-        note: patch.note,
-      });
+      const applyPatch = (h: VillageHouse): VillageHouse => {
+        const flippedSide = patch.side !== h.side;
+        return {
+          ...h,
+          houseNumber: patch.houseNumber,
+          side: patch.side,
+          lat: flippedSide ? 2 * h.roadLat - h.lat : h.lat,
+          lng: flippedSide ? 2 * h.roadLng - h.lng : h.lng,
+          placeType: patch.placeType,
+          shopCategory: patch.placeType === 'shop' ? patch.shopCategory : undefined,
+          shopName: patch.shopName,
+          note: patch.note,
+        };
+      };
       setHouses((prev) => {
         const nextHouses = prev.map((h) => (h.id === houseId ? applyPatch(h) : h));
         saveLocalStore({ roads: roadsTourRef.current, houses: nextHouses });
@@ -3241,6 +3380,79 @@ export default function App() {
       setTargetHouse((prev) => (prev && prev.id === houseId ? applyPatch(prev) : prev));
     },
     []
+  );
+
+  const handleSelectSimStudioRoad = useCallback(
+    (roadId: string) => {
+      setSimStudioRoadId(roadId);
+      setSimStudioAutoPlaySignal((s) => s + 1);
+      const r = roadsTourRef.current.find((rd) => rd.id === roadId);
+      if (r && r.points.length >= 2) {
+        setFocusTarget({
+          lat: r.points[0].lat,
+          lng: r.points[0].lng,
+          boundsPoints: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+          key: Date.now(),
+        });
+      } else if (r && r.points.length === 1) {
+        setFocusTarget({
+          lat: r.points[0].lat,
+          lng: r.points[0].lng,
+          zoom: 19,
+          key: Date.now(),
+        });
+      }
+    },
+    []
+  );
+
+  const handleSimStudioPositionChange = useCallback(
+    (pos: { lat: number; lng: number; headingDeg: number } | null, panMap: boolean) => {
+      setSimStudioCursor(pos);
+      if (pos && panMap) {
+        setFocusTarget({
+          lat: pos.lat,
+          lng: pos.lng,
+          key: Date.now(),
+        });
+      }
+    },
+    []
+  );
+
+  const handleStampSimStudioSegment = useCallback(
+    (roadId: string, segIndex: number, access: VehicleSegmentAccess) => {
+      setRoads((prev) => {
+        const next = stampRoadSegmentAccess(prev, roadId, segIndex, access);
+        saveLocalStore({ roads: next, houses });
+        return next;
+      });
+    },
+    [houses]
+  );
+
+  const handleStampSimStudioWholeRoad = useCallback(
+    (roadId: string, access: 'car' | 'no_car') => {
+      setRoads((prev) => {
+        const next = stampRoadSegmentAccess(prev, roadId, 'all', access);
+        saveLocalStore({ roads: next, houses });
+        return next;
+      });
+    },
+    [houses]
+  );
+
+  const handleDeleteSimStudioRoad = useCallback(
+    (roadId: string) => {
+      const nextRoads = roadsTourRef.current.filter((r) => r.id !== roadId);
+      const nextHouses = houses.filter((h) => h.roadId !== roadId);
+      setRoads(nextRoads);
+      setHouses(nextHouses);
+      saveLocalStore({ roads: nextRoads, houses: nextHouses });
+      setSimStudioRoadId((prev) => (prev === roadId ? null : prev));
+      setSimStudioCursor(null);
+    },
+    [houses]
   );
 
   // Live Mid-Segment Snap indicators & 1-tap Touch Old Road helpers for Add & AutoMapX
@@ -4189,6 +4401,7 @@ export default function App() {
     if (isAutoRecording) {
       return {
         points: autoPoints,
+        segmentAccess: autoSegmentAccess,
         simPoint: null,
         houses: [],
       };
@@ -4196,12 +4409,13 @@ export default function App() {
     if (selectedAutoTrip) {
       return {
         points: selectedAutoTrip.points,
+        segmentAccess: selectedAutoTrip.segmentAccess,
         simPoint: autoSimPoint,
-        houses: selectedAutoTrip.houses,
+        houses: [],
       };
     }
     return null;
-  }, [isAutoRecording, autoPoints, selectedAutoTrip, autoSimPoint]);
+  }, [isAutoRecording, autoPoints, autoSegmentAccess, selectedAutoTrip, autoSimPoint]);
 
   const autoMapElement = (
     <VillageMap
@@ -4219,6 +4433,8 @@ export default function App() {
       targetHouse={null}
       darkMode={theme === 'dark'}
       isolateNavigation={false}
+      hideHouses={true}
+      showVehicleHierarchy={true}
       activeInstruction={null}
       distanceToNextTurnMeters={null}
       interactionMode="browse"
@@ -4685,6 +4901,47 @@ export default function App() {
     />
   );
 
+  const simulationMapElement = (
+    <VillageMap
+      roads={roads}
+      houses={houses}
+      draftHouses={[]}
+      activeWalkSegments={[]}
+      draftJunctions={[]}
+      currentGps={userLocation}
+      userHeadingDeg={userHeadingDeg}
+      gpsQuality={gpsQuality}
+      routeResult={null}
+      alternativeRoutes={[]}
+      liveProgress={null}
+      targetHouse={null}
+      darkMode={theme === 'dark'}
+      isolateNavigation={false}
+      hideHouses={false}
+      showVehicleHierarchy={true}
+      activeInstruction={null}
+      distanceToNextTurnMeters={null}
+      interactionMode="browse"
+      onMapClick={() => {}}
+      onNavigateHouse={startNavigateToHouse}
+      onSelectPendingBranch={handleSelectPendingBranch}
+      onCenterGps={() => handleLocateMe(true)}
+      isFollowingGps={isFollowingGps}
+      initialView={mapViewRef.current}
+      onViewChange={(view) => {
+        mapViewRef.current = view;
+      }}
+      onUserDrag={() => {
+        autoFollowGpsRef.current = false;
+        setIsFollowingGps(false);
+      }}
+      focusTarget={focusTarget}
+      onSelectRoad={handleSelectSimStudioRoad}
+      highlightedRoadId={simStudioRoadId}
+      simulationSimPoint={simStudioCursor}
+    />
+  );
+
   const isPureRecordingScreen = mode === 'map' && mapCleanScreen;
 
   return (
@@ -5019,6 +5276,44 @@ export default function App() {
               </div>
             )}
           </div>
+        ) : mode === 'simulation' ? (
+          <SimulationWorkspace
+            roads={roads}
+            houses={houses}
+            selectedRoadId={simStudioRoadId}
+            autoPlaySignal={simStudioAutoPlaySignal}
+            onSelectRoad={handleSelectSimStudioRoad}
+            onFitRoad={(road) => {
+              if (road.points.length >= 2) {
+                setFocusTarget({
+                  lat: road.points[0].lat,
+                  lng: road.points[0].lng,
+                  boundsPoints: road.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+                  key: Date.now(),
+                });
+              }
+            }}
+            onFitAllRoads={() => handleFitAllSaved()}
+            onUpdateRoadMeta={handleAmxUpdateSimRoadMeta}
+            onDeleteRoad={handleDeleteSimStudioRoad}
+            onStampSegmentCar={handleStampSimStudioSegment}
+            onStampWholeRoadCar={handleStampSimStudioWholeRoad}
+            onSimPositionChange={handleSimStudioPositionChange}
+            onAddHouseOnRoad={handleAmxAddHouseOnSavedRoad}
+            onUpdateHouse={handleUpdateHouse}
+            onDeleteHouse={handleAmxRemoveSavedHouse}
+            onFocusHouse={(house) =>
+              setFocusTarget({
+                lat: house.lat,
+                lng: house.lng,
+                zoom: 19,
+                key: Date.now(),
+              })
+            }
+            onLocateMe={() => handleLocateMe(true)}
+            nextSuggestedHouse={nextSuggestedHouse}
+            mapSlot={simulationMapElement}
+          />
         ) : mode === 'vehicles' ? (
           <div className="w-full h-full">
             <VehiclesWorkspace
@@ -5206,6 +5501,10 @@ export default function App() {
             isAutoPaused={isAutoPaused}
             autoPoints={autoPoints}
             autoElapsedSeconds={autoElapsedSeconds}
+            autoCarOn={autoCarOn}
+            onToggleAutoCar={handleToggleAutoCar}
+            autoCarMeters={autoCarMeters}
+            autoNoCarMeters={autoNoCarMeters}
             gpsPrecisionMode={gpsPrecisionMode}
             onTogglePrecisionMode={() =>
               setGpsPrecisionMode((m) => (m === 'accurate_5m' ? 'relaxed_15m' : 'accurate_5m'))
@@ -5801,7 +6100,7 @@ export default function App() {
       {accessRole === 'company' && !isPureRecordingScreen && (
       <nav
         aria-label="Primary Workspace Navigation"
-        className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-1 sm:px-6 pt-1 pb-[max(1.1rem,calc(env(safe-area-inset-bottom)+0.45rem))] sm:py-1.5 grid grid-cols-5 items-center z-[530] shadow-[0_-4px_16px_rgba(15,23,42,0.08)] dark:shadow-[0_-4px_16px_rgba(0,0,0,0.35)]"
+        className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-1 sm:px-6 pt-1 pb-[max(1.1rem,calc(env(safe-area-inset-bottom)+0.45rem))] sm:py-1.5 grid grid-cols-6 items-center z-[530] shadow-[0_-4px_16px_rgba(15,23,42,0.08)] dark:shadow-[0_-4px_16px_rgba(0,0,0,0.35)]"
       >
         <button
           type="button"
@@ -5813,7 +6112,7 @@ export default function App() {
           }`}
         >
           <Navigation className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-tight whitespace-nowrap">
+          <span className="text-[9.5px] sm:text-[10px] font-semibold tracking-tight whitespace-nowrap">
             Navigate
           </span>
         </button>
@@ -5831,7 +6130,7 @@ export default function App() {
           }`}
         >
           <PlusCircle className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-tight whitespace-nowrap">
+          <span className="text-[9.5px] sm:text-[10px] font-semibold tracking-tight whitespace-nowrap">
             Add
           </span>
         </button>
@@ -5864,7 +6163,7 @@ export default function App() {
               <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-violet-600 animate-pulse" />
             )}
           </div>
-          <span className="text-[10px] font-bold tracking-tight whitespace-nowrap">
+          <span className="text-[9.5px] sm:text-[10px] font-bold tracking-tight whitespace-nowrap">
             AutoMapX
           </span>
         </button>
@@ -5897,8 +6196,27 @@ export default function App() {
               <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-red-500 animate-pulse" />
             )}
           </div>
-          <span className="text-[10px] font-semibold tracking-tight whitespace-nowrap">
+          <span className="text-[9.5px] sm:text-[10px] font-semibold tracking-tight whitespace-nowrap">
             Auto
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setMode('simulation');
+            setTargetHouse(null);
+            setTimeout(() => handleFitAllSaved(), 60);
+          }}
+          className={`min-h-[48px] sm:min-h-[44px] py-1 rounded-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
+            mode === 'simulation'
+              ? 'text-blue-700 dark:text-blue-400 bg-blue-50/80 dark:bg-blue-950/40'
+              : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+          }`}
+        >
+          <Play className="w-5 h-5" />
+          <span className="text-[9.5px] sm:text-[10px] font-semibold tracking-tight whitespace-nowrap">
+            Simulation
           </span>
         </button>
 
@@ -5919,7 +6237,7 @@ export default function App() {
           }`}
         >
           <Eye className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-tight whitespace-nowrap">
+          <span className="text-[9.5px] sm:text-[10px] font-semibold tracking-tight whitespace-nowrap">
             Preview ({houses.length})
           </span>
         </button>

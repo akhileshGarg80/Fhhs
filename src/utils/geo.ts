@@ -1438,6 +1438,7 @@ export function autoLinkNewRoadsToNetwork(
   const linkedNew: VillageRoad[] = newRoads.map((r) => ({
     ...r,
     points: r.points.map((p) => ({ ...p })),
+    ...(r.segmentAccess ? { segmentAccess: r.segmentAccess.slice() } : {}),
   }));
   const linkedSummaries: string[] = [];
 
@@ -1522,6 +1523,9 @@ export function autoLinkNewRoadsToNetwork(
       if (bestMatch.attachAtEnd === 'start') {
         if (haversineMeters(road.points[0], junc) > 0.6) {
           road.points.unshift({ lat: junc.lat, lng: junc.lng, accuracy: 1.5 });
+          if (road.segmentAccess && road.segmentAccess.length === road.points.length - 2) {
+            road.segmentAccess.unshift(road.segmentAccess[0] ?? 'unmarked');
+          }
         } else {
           road.points[0] = { ...road.points[0], lat: junc.lat, lng: junc.lng };
         }
@@ -1529,6 +1533,11 @@ export function autoLinkNewRoadsToNetwork(
         const last = road.points[road.points.length - 1];
         if (haversineMeters(last, junc) > 0.6) {
           road.points.push({ lat: junc.lat, lng: junc.lng, accuracy: 1.5 });
+          if (road.segmentAccess && road.segmentAccess.length === road.points.length - 2) {
+            road.segmentAccess.push(
+              road.segmentAccess[road.segmentAccess.length - 1] ?? 'unmarked'
+            );
+          }
         } else {
           road.points[road.points.length - 1] = { ...last, lat: junc.lat, lng: junc.lng };
         }
@@ -1566,6 +1575,9 @@ export function autoLinkNewRoadsToNetwork(
         }
         if (trimStartCount > 0) {
           road.points = road.points.slice(trimStartCount);
+          if (road.segmentAccess && road.segmentAccess.length >= trimStartCount) {
+            road.segmentAccess = road.segmentAccess.slice(trimStartCount);
+          }
         }
       }
 
@@ -1582,6 +1594,12 @@ export function autoLinkNewRoadsToNetwork(
         }
         if (trimEndCount > 0) {
           road.points = road.points.slice(0, road.points.length - trimEndCount);
+          if (road.segmentAccess && road.segmentAccess.length >= trimEndCount) {
+            road.segmentAccess = road.segmentAccess.slice(
+              0,
+              road.segmentAccess.length - trimEndCount
+            );
+          }
         }
       }
 
@@ -1603,6 +1621,9 @@ export function autoLinkNewRoadsToNetwork(
                 lng: insertedPoint.lng,
                 accuracy: 1.5,
               });
+              if (road.segmentAccess && road.segmentAccess.length === road.points.length - 2) {
+                road.segmentAccess.unshift(road.segmentAccess[0] ?? 'unmarked');
+              }
             } else {
               road.points[0] = {
                 ...road.points[0],
@@ -1635,6 +1656,11 @@ export function autoLinkNewRoadsToNetwork(
                 lng: insertedPoint.lng,
                 accuracy: 1.5,
               });
+              if (road.segmentAccess && road.segmentAccess.length === road.points.length - 2) {
+                road.segmentAccess.push(
+                  road.segmentAccess[road.segmentAccess.length - 1] ?? 'unmarked'
+                );
+              }
             } else {
               road.points[road.points.length - 1] = {
                 ...lastPt,
@@ -1682,6 +1708,9 @@ export function autoLinkNewRoadsToNetwork(
           for (const h of newBySeg) {
             const { road: splitNew } = insertTouchPointIntoRoad(road, h.newSegIdx, h.point);
             road.points = splitNew.points;
+            if (splitNew.segmentAccess) {
+              road.segmentAccess = splitNew.segmentAccess;
+            }
           }
 
           let updatedEx = ex;
@@ -1696,7 +1725,11 @@ export function autoLinkNewRoadsToNetwork(
         }
       }
 
-      road.points = dedupSequentialPoints(road.points, 0.35);
+      const deduped = dedupSequentialPointsWithAccess(road.points, road.segmentAccess, 0.35);
+      road.points = deduped.points;
+      if (deduped.segmentAccess) {
+        road.segmentAccess = deduped.segmentAccess;
+      }
       road.distanceMeters = computePathDistance(road.points);
     }
 
@@ -1704,6 +1737,7 @@ export function autoLinkNewRoadsToNetwork(
     updatedExisting.push({
       ...road,
       points: road.points.map((p) => ({ ...p })),
+      ...(road.segmentAccess ? { segmentAccess: road.segmentAccess.slice() } : {}),
       junctions: road.junctions?.map((j) => ({
         ...j,
         ...(j.branches ? { branches: j.branches.map((b) => ({ ...b })) } : {}),
@@ -1730,16 +1764,33 @@ export interface RoadSnapHit {
   distMeters: number;
 }
 
-function dedupSequentialPoints(points: LatLngPoint[], minStepMeters = 0.35): LatLngPoint[] {
-  if (points.length <= 2) return points;
-  const out: LatLngPoint[] = [points[0]];
+function dedupSequentialPointsWithAccess(
+  points: LatLngPoint[],
+  segmentAccess: VehicleSegmentAccess[] | undefined,
+  minStepMeters = 0.35
+): { points: LatLngPoint[]; segmentAccess?: VehicleSegmentAccess[] } {
+  if (points.length <= 2) {
+    return { points, segmentAccess };
+  }
+  const hasSyncAccess = Boolean(segmentAccess && segmentAccess.length === points.length - 1);
+  const outPts: LatLngPoint[] = [points[0]];
+  const outAccess: VehicleSegmentAccess[] = [];
   for (let i = 1; i < points.length; i++) {
     const isLast = i === points.length - 1;
-    if (haversineMeters(out[out.length - 1], points[i]) >= minStepMeters || isLast) {
-      out.push(points[i]);
+    if (haversineMeters(outPts[outPts.length - 1], points[i]) >= minStepMeters || isLast) {
+      outPts.push(points[i]);
+      if (hasSyncAccess) {
+        outAccess.push(segmentAccess![i - 1] ?? 'unmarked');
+      }
     }
   }
-  return out;
+  return hasSyncAccess
+    ? { points: outPts, segmentAccess: outAccess }
+    : { points: outPts, segmentAccess };
+}
+
+function dedupSequentialPoints(points: LatLngPoint[], minStepMeters = 0.35): LatLngPoint[] {
+  return dedupSequentialPointsWithAccess(points, undefined, minStepMeters).points;
 }
 
 /**
@@ -1808,10 +1859,16 @@ export function insertTouchPointIntoRoad(
     accuracy: 1.5,
     timestamp: Date.now(),
   });
+  let nextSegmentAccess = road.segmentAccess;
+  if (road.segmentAccess && road.segmentAccess.length === road.points.length - 1) {
+    nextSegmentAccess = road.segmentAccess.slice();
+    nextSegmentAccess.splice(segIndex + 1, 0, nextSegmentAccess[segIndex]);
+  }
   return {
     road: {
       ...road,
       points: nextPoints,
+      ...(nextSegmentAccess ? { segmentAccess: nextSegmentAccess } : {}),
       distanceMeters: computePathDistance(nextPoints),
     },
     insertedPoint: { lat: pt.lat, lng: pt.lng },
@@ -2021,6 +2078,7 @@ export interface SimWaypoint {
   lng: number;
   bearingDeg: number;
   cumulativeMeters: number;
+  segIndex?: number;
 }
 
 /**
@@ -2033,7 +2091,7 @@ export function buildSimulatorWaypoints(
 ): SimWaypoint[] {
   if (points.length === 0) return [];
   if (points.length === 1) {
-    return [{ lat: points[0].lat, lng: points[0].lng, bearingDeg: 0, cumulativeMeters: 0 }];
+    return [{ lat: points[0].lat, lng: points[0].lng, bearingDeg: 0, cumulativeMeters: 0, segIndex: 0 }];
   }
 
   const result: SimWaypoint[] = [];
@@ -2051,6 +2109,7 @@ export function buildSimulatorWaypoints(
         lng: a.lng,
         bearingDeg: bearing,
         cumulativeMeters: 0,
+        segIndex: 0,
       });
     }
 
@@ -2068,6 +2127,7 @@ export function buildSimulatorWaypoints(
         lng,
         bearingDeg: bearing,
         cumulativeMeters: totalMeters,
+        segIndex: i,
       });
     }
   }

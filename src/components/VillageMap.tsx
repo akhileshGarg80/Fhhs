@@ -7,6 +7,7 @@ import type {
   LatLngPoint,
   NavigationInstruction,
   RoadJunction,
+  VehicleSegmentAccess,
   VillageHouse,
   VillageRoad,
   VillageRouteResult,
@@ -48,6 +49,7 @@ export type MapInteractionMode =
 
 export interface AutoTripOverlay {
   points: LatLngPoint[];
+  segmentAccess?: VehicleSegmentAccess[];
   simPoint?: { lat: number; lng: number; headingDeg: number } | null;
   houses: VillageHouse[];
 }
@@ -165,6 +167,9 @@ interface VillageMapProps {
   autoMapXOverlay?: AutoMapXOverlay | null;
   liveRoadSnap?: { lat: number; lng: number; roadName: string; distMeters: number } | null;
   roadEditor?: RoadEditorConfig | null;
+  onSelectRoad?: (roadId: string) => void;
+  highlightedRoadId?: string | null;
+  simulationSimPoint?: { lat: number; lng: number; headingDeg: number } | null;
 }
 
 const TILE_LAYERS: Record<
@@ -257,6 +262,9 @@ export default function VillageMap({
   autoMapXOverlay = null,
   liveRoadSnap = null,
   roadEditor = null,
+  onSelectRoad,
+  highlightedRoadId = null,
+  simulationSimPoint = null,
 }: VillageMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -271,6 +279,7 @@ export default function VillageMap({
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
   const gpsLayerRef = useRef<L.LayerGroup | null>(null);
   const vehicleSimLayerRef = useRef<L.LayerGroup | null>(null);
+  const simulationLayerRef = useRef<L.LayerGroup | null>(null);
   const vehicleOverlayRef = useRef(vehicleOverlay);
   vehicleOverlayRef.current = vehicleOverlay;
 
@@ -282,6 +291,8 @@ export default function VillageMap({
   onSelectRouteIndexRef.current = onSelectRouteIndex;
   const onSelectPendingBranchRef = useRef(onSelectPendingBranch);
   onSelectPendingBranchRef.current = onSelectPendingBranch;
+  const onSelectRoadRef = useRef(onSelectRoad);
+  onSelectRoadRef.current = onSelectRoad;
   const onViewChangeRef = useRef(onViewChange);
   onViewChangeRef.current = onViewChange;
   const onUserDragRef = useRef(onUserDrag);
@@ -343,6 +354,7 @@ export default function VillageMap({
     housesLayerRef.current = L.layerGroup().addTo(map);
     gpsLayerRef.current = L.layerGroup().addTo(map);
     vehicleSimLayerRef.current = L.layerGroup().addTo(map);
+    simulationLayerRef.current = L.layerGroup().addTo(map);
 
     map.on('click', (e: L.LeafletMouseEvent) => {
       const ed = roadEditorRef.current;
@@ -794,8 +806,21 @@ export default function VillageMap({
       const isMutedDuringTrack = Boolean(isolateNavigation && targetHouse && !isTrackedRoad);
       const isSelectedForEdit = Boolean(isEditing && roadEditor?.activeRoadId === r.id);
       const isVehicleActiveRoad = Boolean(isVehicleSim && vehicleOverlay?.currentRoadId === r.id);
+      const isHighlighted = Boolean(highlightedRoadId && highlightedRoadId === r.id);
+      const canSelectRoadDirectly = Boolean(onSelectRoad && !isEditing && !isVehicleSim);
       const hasHierarchyAccess =
         showVehicleHierarchy && r.segmentAccess && r.segmentAccess.length === r.points.length - 1;
+
+      if (isHighlighted) {
+        L.polyline(latlngs, {
+          color: '#38bdf8',
+          weight: 14,
+          opacity: 0.42,
+          lineCap: 'round',
+          lineJoin: 'round',
+          interactive: false,
+        }).addTo(group);
+      }
 
       if (hasHierarchyAccess && !isEditing && !isMutedDuringTrack) {
         // Draw each contiguous run by Vehicle Access status (Main Road = Blue, Car = Green, No Car = Amber-Orange)
@@ -821,10 +846,10 @@ export default function VillageMap({
               : '#0f766e';
           const segWeight =
             st === 'car' && isMain
-              ? isVehicleActiveRoad
+              ? isVehicleActiveRoad || isHighlighted
                 ? 9
                 : 7.5
-              : isVehicleActiveRoad
+              : isVehicleActiveRoad || isHighlighted
               ? 7
               : 5;
 
@@ -852,6 +877,11 @@ export default function VillageMap({
               L.DomEvent.stopPropagation(ev);
               vehicleOverlayRef.current?.onSelectRoad?.(r.id);
             });
+          } else if (canSelectRoadDirectly) {
+            segLine.on('click', (ev) => {
+              L.DomEvent.stopPropagation(ev);
+              onSelectRoadRef.current?.(r.id);
+            });
           }
           const roleTag =
             st === 'car'
@@ -861,16 +891,19 @@ export default function VillageMap({
               : st === 'no_car'
               ? 'No Car (Narrow Lane)'
               : 'Unmarked';
-          segLine.bindTooltip(`${r.name} · ${roleTag} · ${formatDistance(r.distanceMeters)}`, {
-            sticky: true,
-          });
+          segLine.bindTooltip(
+            `${r.name} · ${roleTag} · ${formatDistance(r.distanceMeters)}${
+              canSelectRoadDirectly ? ' · Tap to simulate' : ''
+            }`,
+            { sticky: true }
+          );
           segLine.addTo(group);
 
           runStart = runEnd + 1;
         }
       } else {
         const line = L.polyline(latlngs, {
-          color: isSelectedForEdit
+          color: isSelectedForEdit || isHighlighted
             ? '#0284c7'
             : isVehicleActiveRoad
             ? '#7c3aed'
@@ -879,9 +912,14 @@ export default function VillageMap({
             : isKachha
             ? '#d97706'
             : '#0f766e',
-          weight: isSelectedForEdit || isVehicleActiveRoad ? 7 : isMutedDuringTrack ? 3.5 : 5,
+          weight:
+            isSelectedForEdit || isVehicleActiveRoad || isHighlighted
+              ? 7
+              : isMutedDuringTrack
+              ? 3.5
+              : 5,
           opacity:
-            isSelectedForEdit || isVehicleActiveRoad
+            isSelectedForEdit || isVehicleActiveRoad || isHighlighted
               ? 0.98
               : isEditing
               ? 0.65
@@ -906,12 +944,19 @@ export default function VillageMap({
             L.DomEvent.stopPropagation(ev);
             vehicleOverlayRef.current?.onSelectRoad?.(r.id);
           });
+        } else if (canSelectRoadDirectly) {
+          line.on('click', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            onSelectRoadRef.current?.(r.id);
+          });
         }
         line.bindTooltip(
           isEditing
             ? `${r.name} · ${r.points.length} pts${isSelectedForEdit ? ' (Selected)' : ' · Tap to select'}`
             : isVehicleSim
             ? `${r.name} · Tap to jump Vehicle here`
+            : canSelectRoadDirectly
+            ? `${r.name} · ${formatDistance(r.distanceMeters)} · Tap to simulate`
             : `${r.name} · ${getSurfaceLabel(r.surface)} · ${formatDistance(r.distanceMeters)}`,
           { sticky: true }
         );
@@ -1023,7 +1068,69 @@ export default function VillageMap({
     showVehicleHierarchy,
     vehicleOverlay?.active,
     vehicleOverlay?.currentRoadId,
+    highlightedRoadId,
+    Boolean(onSelectRoad),
   ]);
+
+  // Render Company Simulation Cursor + Left/Right Orientation Guides
+  useEffect(() => {
+    const group = simulationLayerRef.current;
+    if (!group) return;
+    group.clearLayers();
+    if (!simulationSimPoint) return;
+
+    const sp = simulationSimPoint;
+    const leftPt = offsetCoord(sp, (sp.headingDeg + 270) % 360, 7);
+    const rightPt = offsetCoord(sp, (sp.headingDeg + 90) % 360, 7);
+
+    L.polyline(
+      [
+        [leftPt.lat, leftPt.lng],
+        [sp.lat, sp.lng],
+        [rightPt.lat, rightPt.lng],
+      ],
+      {
+        color: '#0284c7',
+        weight: 2.5,
+        opacity: 0.78,
+        dashArray: '4 4',
+        interactive: false,
+      }
+    ).addTo(group);
+
+    L.circleMarker([leftPt.lat, leftPt.lng], {
+      radius: 4.5,
+      color: '#ffffff',
+      weight: 1.5,
+      fillColor: '#047857',
+      fillOpacity: 0.95,
+      interactive: false,
+    }).addTo(group);
+
+    L.circleMarker([rightPt.lat, rightPt.lng], {
+      radius: 4.5,
+      color: '#ffffff',
+      weight: 1.5,
+      fillColor: '#d97706',
+      fillOpacity: 0.95,
+      interactive: false,
+    }).addTo(group);
+
+    const simIcon = L.divIcon({
+      className: 'grampath-sim-studio-cursor',
+      iconSize: [36, 36],
+      iconAnchor: [18, 18],
+      html: `<div style="width:36px;height:36px;border-radius:999px;background:rgba(2,132,199,0.28);display:flex;align-items:center;justify-content:center;"><div style="width:24px;height:24px;border-radius:999px;background:#0284c7;border:2.5px solid #ffffff;box-shadow:0 2px 8px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;"><svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg></div></div>`,
+    });
+    L.marker([sp.lat, sp.lng], {
+      icon: simIcon,
+      zIndexOffset: 940,
+      rotateWithView: true,
+      rotation: (sp.headingDeg * Math.PI) / 180,
+    })
+      .bindTooltip('Simulation Position')
+      .addTo(group);
+  }, [simulationSimPoint]);
 
   // Render Road Editor Vertices, Drawn Line Preview & Live Magnetic Snap Target (between A & B)
   useEffect(() => {
@@ -1576,21 +1683,59 @@ export default function VillageMap({
     const latlngs = pts.map((p) => [p.lat, p.lng] as [number, number]);
 
     if (latlngs.length >= 2) {
-      L.polyline(latlngs, {
-        color: '#0c4a6e',
-        weight: 10,
-        opacity: 0.28,
-        lineCap: 'round',
-        lineJoin: 'round',
-      }).addTo(group);
+      const segAccess = autoTripOverlay.segmentAccess;
+      const hasPerSegmentAccess = Boolean(segAccess && segAccess.length === pts.length - 1);
 
-      L.polyline(latlngs, {
-        color: '#0284c7',
-        weight: 6,
-        opacity: 0.96,
-        lineCap: 'round',
-        lineJoin: 'round',
-      }).addTo(group);
+      if (hasPerSegmentAccess && segAccess) {
+        let runStart = 0;
+        while (runStart < segAccess.length) {
+          const st = segAccess[runStart];
+          let runEnd = runStart;
+          while (runEnd + 1 < segAccess.length && segAccess[runEnd + 1] === st) {
+            runEnd++;
+          }
+          const slicePts = latlngs.slice(runStart, runEnd + 2);
+          const casingColor =
+            st === 'car' ? '#064e3b' : st === 'no_car' ? '#7c2d12' : '#0c4a6e';
+          const strokeColor =
+            st === 'car' ? '#059669' : st === 'no_car' ? '#ea580c' : '#0284c7';
+
+          L.polyline(slicePts, {
+            color: casingColor,
+            weight: 10,
+            opacity: 0.28,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }).addTo(group);
+
+          L.polyline(slicePts, {
+            color: strokeColor,
+            weight: 6.5,
+            opacity: 0.96,
+            dashArray: st === 'no_car' ? '7 5' : undefined,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }).addTo(group);
+
+          runStart = runEnd + 1;
+        }
+      } else {
+        L.polyline(latlngs, {
+          color: '#0c4a6e',
+          weight: 10,
+          opacity: 0.28,
+          lineCap: 'round',
+          lineJoin: 'round',
+        }).addTo(group);
+
+        L.polyline(latlngs, {
+          color: '#0284c7',
+          weight: 6,
+          opacity: 0.96,
+          lineCap: 'round',
+          lineJoin: 'round',
+        }).addTo(group);
+      }
 
       let accum = 0;
       for (let i = 1; i < pts.length; i++) {

@@ -144,6 +144,7 @@ export interface AutoTrip {
   startedAt: string;
   endedAt: string;
   linkedRoadId?: string;
+  segmentAccess?: VehicleSegmentAccess[];
   houses: VillageHouse[];
 }
 
