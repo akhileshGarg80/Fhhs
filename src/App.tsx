@@ -1,11 +1,15 @@
 import {
   Bookmark,
+  Car,
   ChevronDown,
   ChevronUp,
   Eye,
+  EyeOff,
   Gauge,
   Loader2,
+  Map as MapIcon,
   MapPin,
+  Maximize2,
   Moon,
   Navigation,
   Plus,
@@ -26,11 +30,15 @@ import AutoMapXWorkspace, {
 import AutoWorkspace from './components/AutoWorkspace.tsx';
 import NavigationPanel from './components/NavigationPanel.tsx';
 import { PWAInstallButton } from './components/PWAInstallButton.tsx';
-import SavedDataView from './components/SavedDataView.tsx';
+import SavedDataView, { type PreviewRoadEditorUi } from './components/SavedDataView.tsx';
+import VehiclesWorkspace, { type VehicleSimSpeed } from './components/VehiclesWorkspace.tsx';
 import VillageMap, {
   type AutoMapXOverlay,
   type AutoTripOverlay,
   type MapInteractionMode,
+  type RoadEditorConfig,
+  type RoadEditorTool,
+  type VehicleOverlayConfig,
 } from './components/VillageMap.tsx';
 import type {
   AutoMapXNode,
@@ -42,24 +50,37 @@ import type {
   LatLngPoint,
   RoadJunction,
   SavedSearchArea,
+  VehicleSegmentAccess,
   VillageHouse,
   VillageRoad,
 } from './types/map.ts';
 import {
+  type AheadRoadTarget,
+  applyHandDrawnSegmentToRoads,
   autoLinkNewRoadsToNetwork,
   buildJunctionBranches,
   buildSimulatorWaypoints,
+  buildVehicleTourWaypoints,
   calculateBearing,
+  classifyVillageRoadHierarchy,
   collectPendingJunctionBranches,
+  commitEditorAutoMapJoin,
   computeLiveRouteProgress,
   computePathDistance,
   directionLabel,
   directionOffsetDeg,
+  eraseRoadPointsNear,
+  findAheadRoadTarget,
+  findNearestRoadSnap,
   findRoutesToHouse,
   formatDistance,
   getNextSequentialHouseNumber,
   haversineMeters,
+  insertTouchPointIntoRoad,
   offsetCoord,
+  stampRoadSegmentAccess,
+  summarizeVehicleHierarchy,
+  type VehicleTourWaypoint,
 } from './utils/geo.ts';
 import {
   type GpsPrecisionMode,
@@ -81,7 +102,14 @@ import {
   saveSavedAreas,
 } from './utils/storage.ts';
 
-type WorkspaceMode = 'navigate' | 'add' | 'automapx' | 'auto' | 'preview';
+type WorkspaceMode =
+  | 'navigate'
+  | 'add'
+  | 'automapx'
+  | 'auto'
+  | 'preview'
+  | 'map'
+  | 'vehicles';
 
 const DRAFT_WALK_KEY = 'grampath_walk_draft_v2';
 
@@ -199,6 +227,52 @@ export default function App() {
   const [previewToHouseId, setPreviewToHouseId] = useState<string | null>(null);
   const [previewSelectedRouteIndex, setPreviewSelectedRouteIndex] = useState(0);
 
+  // Preview Hand Road Editor (Move Map default / Tiny Erase / Endpoint AutoMap / Draw / Undo / Redo)
+  const [editorEnabled, setEditorEnabled] = useState(false);
+  const [editorTool, setEditorTool] = useState<RoadEditorTool>('pan');
+  const [editorActiveRoadId, setEditorActiveRoadId] = useState<string | null>(null);
+  const [editorEditAllScope, setEditorEditAllScope] = useState(true);
+  const [editorEraserRadius, setEditorEraserRadius] = useState(2);
+  const [editorSnapEnabled, setEditorSnapEnabled] = useState(true);
+  const [editorDraftRoads, setEditorDraftRoads] = useState<VillageRoad[]>([]);
+  const [editorHistory, setEditorHistory] = useState<VillageRoad[][]>([]);
+  const [editorFuture, setEditorFuture] = useState<VillageRoad[][]>([]);
+  const [editorDrawPoints, setEditorDrawPoints] = useState<LatLngPoint[]>([]);
+  const [editorHoverPt, setEditorHoverPt] = useState<{ lat: number; lng: number } | null>(null);
+  const editorPreStrokeRef = useRef<VillageRoad[] | null>(null);
+  const editorEraseChangedRef = useRef(false);
+  const editorDraftRoadsRef = useRef(editorDraftRoads);
+  editorDraftRoadsRef.current = editorDraftRoads;
+
+  // Editor Endpoint AutoMap + Live GPS Reconnection State
+  const [editorAmxActive, setEditorAmxActive] = useState(false);
+  const [editorAmxAnchor, setEditorAmxAnchor] = useState<{
+    roadId: string;
+    end: 'start' | 'end';
+  } | null>(null);
+  const [editorAmxRunning, setEditorAmxRunning] = useState(false);
+  const [editorAmxPaused, setEditorAmxPaused] = useState(false);
+  const [editorAmxLiveGps, setEditorAmxLiveGps] = useState(false);
+  const [editorAmxSpeedMps, setEditorAmxSpeedMps] = useState(0.35);
+  const [editorAmxPoints, setEditorAmxPoints] = useState<LatLngPoint[]>([]);
+  const [editorAmxCursor, setEditorAmxCursor] = useState<{
+    lat: number;
+    lng: number;
+    headingDeg: number;
+  }>({ lat: 24.9852, lng: 82.0625, headingDeg: 0 });
+  const editorAmxPointsRef = useRef(editorAmxPoints);
+  editorAmxPointsRef.current = editorAmxPoints;
+  const editorAmxCursorRef = useRef(editorAmxCursor);
+  editorAmxCursorRef.current = editorAmxCursor;
+  const editorAmxSpeedRef = useRef(editorAmxSpeedMps);
+  editorAmxSpeedRef.current = editorAmxSpeedMps;
+  const editorAmxAnchorRef = useRef(editorAmxAnchor);
+  editorAmxAnchorRef.current = editorAmxAnchor;
+  const editorAmxLastTickRef = useRef(Date.now());
+  const editorAmxAutoPausedAtRef = useRef<string | null>(null);
+  const editorAmxWatchIdRef = useRef<number | null>(null);
+  const editorAmxLastGpsRef = useRef<LatLngPoint | null>(null);
+
   // Add / Walk & Multi-Branch Junction State
   const [captureMode, setCaptureMode] = useState<CaptureMode>('straight_walk');
   const [isRecording, setIsRecording] = useState(false);
@@ -293,7 +367,7 @@ export default function App() {
     headingDeg: 0,
   });
   const [amxPoints, setAmxPoints] = useState<AutoMapXNode[]>([]);
-  const [amxSpeedMps, setAmxSpeedMps] = useState<number>(3.0);
+  const [amxSpeedMps, setAmxSpeedMps] = useState<number>(0.8);
   const [amxIsRunning, setAmxIsRunning] = useState(false);
   const [amxIsPaused, setAmxIsPaused] = useState(false);
   const [amxElapsedSeconds, setAmxElapsedSeconds] = useState(0);
@@ -325,6 +399,18 @@ export default function App() {
   const lastAmxGpsRef = useRef<LatLngPoint | null>(null);
   const amxModeRef = useRef(mode);
   amxModeRef.current = mode;
+
+  // Clean Roads-Only Map Mode + Village Vehicles Access Simulator State
+  const [mapCleanScreen, setMapCleanScreen] = useState(false);
+  const [vehIdx, setVehIdx] = useState(0);
+  const [vehIsPlaying, setVehIsPlaying] = useState(false);
+  const [vehSpeed, setVehSpeed] = useState<VehicleSimSpeed>(0.5);
+  const [vehCarOn, setVehCarOn] = useState(true);
+  const [vehAutoFollow, setVehAutoFollow] = useState(true);
+  const vehCarOnRef = useRef(vehCarOn);
+  vehCarOnRef.current = vehCarOn;
+  const vehAutoFollowRef = useRef(vehAutoFollow);
+  vehAutoFollowRef.current = vehAutoFollow;
 
   const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
 
@@ -1141,6 +1227,30 @@ export default function App() {
       }
     },
     [roads, houses]
+  );
+
+  const handleFitAllRoadsOnly = useCallback(
+    (roadList: VillageRoad[] = roads) => {
+      const pts: { lat: number; lng: number }[] = roadList.flatMap((r) =>
+        r.points.map((p) => ({ lat: p.lat, lng: p.lng }))
+      );
+      if (pts.length >= 2) {
+        setFocusTarget({
+          lat: pts[0].lat,
+          lng: pts[0].lng,
+          boundsPoints: pts,
+          key: Date.now(),
+        });
+      } else if (pts.length === 1) {
+        setFocusTarget({
+          lat: pts[0].lat,
+          lng: pts[0].lng,
+          zoom: 18,
+          key: Date.now(),
+        });
+      }
+    },
+    [roads]
   );
 
   const startNavigateToHouse = useCallback(
@@ -2979,6 +3089,825 @@ export default function App() {
     );
   }, []);
 
+  // Live Mid-Segment Snap indicators & 1-tap Touch Old Road helpers for Add & AutoMapX
+  const walkActiveTip = useMemo(() => {
+    const activeSeg = walkSegments[walkSegments.length - 1] ?? [];
+    return activeSeg[activeSeg.length - 1] ?? userLocation;
+  }, [walkSegments, userLocation]);
+
+  const walkNearestSnap = useMemo(() => {
+    if (mode !== 'add' || roads.length === 0) return null;
+    return findNearestRoadSnap(walkActiveTip, roads, 24);
+  }, [mode, walkActiveTip, roads]);
+
+  const amxNearestSnap = useMemo(() => {
+    if (mode !== 'automapx' || amxSubMode !== 'build' || roads.length === 0) return null;
+    return findNearestRoadSnap(amxCursor, roads, 24);
+  }, [mode, amxSubMode, amxCursor, roads]);
+
+  const handleSnapWalkToRoad = useCallback(() => {
+    if (!walkNearestSnap) return;
+    const hit = walkNearestSnap;
+    let sharedCoord = hit.point;
+    setRoads((prev) =>
+      prev.map((r) => {
+        if (r.id !== hit.roadId) return r;
+        const res = insertTouchPointIntoRoad(r, hit.segIndex, hit.point);
+        sharedCoord = res.insertedPoint;
+        return res.road;
+      })
+    );
+    const snapPt: LatLngPoint = {
+      lat: sharedCoord.lat,
+      lng: sharedCoord.lng,
+      accuracy: 1.5,
+      timestamp: Date.now(),
+    };
+    setUserLocation(snapPt);
+    setWalkSegments((prev) => {
+      if (prev.length === 0) return [[snapPt]];
+      const next = [...prev];
+      const idx = next.length - 1;
+      const seg = next[idx];
+      if (seg.length === 0 || haversineMeters(seg[seg.length - 1], snapPt) > 0.4) {
+        next[idx] = [...seg, snapPt];
+      } else {
+        next[idx] = [...seg.slice(0, -1), snapPt];
+      }
+      return next;
+    });
+    setFocusTarget({ lat: snapPt.lat, lng: snapPt.lng, key: Date.now() });
+  }, [walkNearestSnap]);
+
+  const handleAmxSnapToRoad = useCallback(() => {
+    if (!amxNearestSnap) return;
+    const hit = amxNearestSnap;
+    let sharedCoord = hit.point;
+    setRoads((prev) =>
+      prev.map((r) => {
+        if (r.id !== hit.roadId) return r;
+        const res = insertTouchPointIntoRoad(r, hit.segIndex, hit.point);
+        sharedCoord = res.insertedPoint;
+        return res.road;
+      })
+    );
+    const nextCur = {
+      lat: sharedCoord.lat,
+      lng: sharedCoord.lng,
+      headingDeg: amxCursorRef.current.headingDeg,
+    };
+    amxCursorRef.current = nextCur;
+    setAmxCursor(nextCur);
+
+    const prevPts = amxPointsRef.current;
+    const prevLast = prevPts[prevPts.length - 1];
+    const addedDist = prevLast ? haversineMeters(prevLast, nextCur) : 0;
+    const newTotal = (prevLast?.cumulativeMeters ?? 0) + addedDist;
+    amxTotalMetersRef.current = newTotal;
+
+    const touchNode: AutoMapXNode = {
+      lat: nextCur.lat,
+      lng: nextCur.lng,
+      accuracy: 1.5,
+      timestamp: Date.now(),
+      headingDeg: nextCur.headingDeg,
+      cumulativeMeters: newTotal,
+      speedMps: amxSpeedRef.current,
+      momentLabel: `Touch ${hit.roadName}`,
+    };
+    const merged = [...prevPts, touchNode];
+    amxPointsRef.current = merged;
+    setAmxPoints(merged);
+    setFocusTarget({ lat: nextCur.lat, lng: nextCur.lng, key: Date.now() });
+  }, [amxNearestSnap]);
+
+  // Preview Hand Road Editor callbacks (deep copy + full Undo/Redo + magnetic A–B snap)
+  const cloneRoadsSnapshot = useCallback(
+    (list: VillageRoad[]): VillageRoad[] =>
+      list.map((r) => ({
+        ...r,
+        points: r.points.map((p) => ({ ...p })),
+        junctions: r.junctions?.map((j) => ({
+          ...j,
+          branches: j.branches?.map((b) => ({ ...b })),
+        })),
+      })),
+    []
+  );
+
+  const resetEditorAmx = useCallback(() => {
+    setEditorAmxActive(false);
+    setEditorAmxAnchor(null);
+    setEditorAmxRunning(false);
+    setEditorAmxPaused(false);
+    setEditorAmxLiveGps(false);
+    setEditorAmxPoints([]);
+    editorAmxPointsRef.current = [];
+    editorAmxAutoPausedAtRef.current = null;
+  }, []);
+
+  const handleStartRoadEdit = useCallback(
+    (roadId?: string) => {
+      const cloned = cloneRoadsSnapshot(roads);
+      const chosenId = roadId ?? cloned[0]?.id ?? null;
+      setEditorDraftRoads(cloned);
+      setEditorHistory([]);
+      setEditorFuture([]);
+      setEditorDrawPoints([]);
+      setEditorHoverPt(null);
+      setEditorActiveRoadId(chosenId);
+      setEditorTool('pan'); // Start in Move Map so user can move around before erasing
+      resetEditorAmx();
+      setEditorEnabled(true);
+
+      const focusRoad = chosenId ? cloned.find((r) => r.id === chosenId) : cloned[0];
+      if (focusRoad && focusRoad.points.length >= 2) {
+        setFocusTarget({
+          lat: focusRoad.points[0].lat,
+          lng: focusRoad.points[0].lng,
+          boundsPoints: focusRoad.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+          key: Date.now(),
+        });
+      }
+    },
+    [roads, cloneRoadsSnapshot, resetEditorAmx]
+  );
+
+  const handleCancelRoadEdit = useCallback(() => {
+    resetEditorAmx();
+    setEditorEnabled(false);
+    setEditorDraftRoads([]);
+    setEditorHistory([]);
+    setEditorFuture([]);
+    setEditorDrawPoints([]);
+    setEditorHoverPt(null);
+  }, [resetEditorAmx]);
+
+  const handleSaveRoadEdit = useCallback(() => {
+    resetEditorAmx();
+    const cleaned = editorDraftRoadsRef.current.filter((r) => r.points.length >= 2);
+    setRoads(cleaned);
+    setEditorEnabled(false);
+    setEditorDraftRoads([]);
+    setEditorHistory([]);
+    setEditorFuture([]);
+    setEditorDrawPoints([]);
+    setEditorHoverPt(null);
+  }, [resetEditorAmx]);
+
+  const handleEraseStrokeStart = useCallback(() => {
+    editorPreStrokeRef.current = cloneRoadsSnapshot(editorDraftRoadsRef.current);
+    editorEraseChangedRef.current = false;
+  }, [cloneRoadsSnapshot]);
+
+  const handleEraseAt = useCallback(
+    (lat: number, lng: number) => {
+      const center = { lat, lng };
+      setEditorDraftRoads((prev) => {
+        let changed = false;
+        const next: VillageRoad[] = [];
+        for (const r of prev) {
+          if (!editorEditAllScope && editorActiveRoadId && r.id !== editorActiveRoadId) {
+            next.push(r);
+            continue;
+          }
+          const nearAny = r.points.some(
+            (p) => haversineMeters(p, center) <= editorEraserRadius * 1.4
+          );
+          if (!nearAny && r.points.length <= 2) {
+            // Check segment pass-through anyway
+            const pieces = eraseRoadPointsNear(r, center, editorEraserRadius);
+            if (
+              pieces.length !== 1 ||
+              pieces[0].points.length !== r.points.length ||
+              pieces[0].id !== r.id
+            ) {
+              changed = true;
+            }
+            next.push(...pieces);
+          } else {
+            const pieces = eraseRoadPointsNear(r, center, editorEraserRadius);
+            if (
+              pieces.length !== 1 ||
+              pieces[0].points.length !== r.points.length ||
+              pieces[0].id !== r.id
+            ) {
+              changed = true;
+            }
+            next.push(...pieces);
+          }
+        }
+        if (!changed) return prev;
+        editorEraseChangedRef.current = true;
+        return next;
+      });
+    },
+    [editorEditAllScope, editorActiveRoadId, editorEraserRadius]
+  );
+
+  const handleEraseStrokeEnd = useCallback(() => {
+    if (editorEraseChangedRef.current && editorPreStrokeRef.current) {
+      const snap = editorPreStrokeRef.current;
+      setEditorHistory((h) => [...h, snap]);
+      setEditorFuture([]);
+    }
+    editorPreStrokeRef.current = null;
+    editorEraseChangedRef.current = false;
+  }, []);
+
+  useEffect(() => {
+    if (!editorEnabled) return;
+    if (editorActiveRoadId && !editorDraftRoads.some((r) => r.id === editorActiveRoadId)) {
+      setEditorActiveRoadId(editorDraftRoads[0]?.id ?? null);
+    }
+  }, [editorEnabled, editorActiveRoadId, editorDraftRoads]);
+
+  const commitDrawnStroke = useCallback(
+    (pts: LatLngPoint[]) => {
+      if (pts.length < 2) return;
+      const before = cloneRoadsSnapshot(editorDraftRoadsRef.current);
+      const { nextRoads, selectedRoadId } = applyHandDrawnSegmentToRoads(pts, before, {
+        activeRoadId: editorActiveRoadId,
+        snapEnabled: editorSnapEnabled,
+        snapRadiusMeters: 16,
+        defaultVillageName: detectedVillage,
+      });
+      setEditorHistory((h) => [...h, before]);
+      setEditorFuture([]);
+      setEditorDraftRoads(nextRoads);
+      if (selectedRoadId) setEditorActiveRoadId(selectedRoadId);
+      setEditorDrawPoints([]);
+    },
+    [cloneRoadsSnapshot, editorActiveRoadId, editorSnapEnabled, detectedVillage]
+  );
+
+  const handleDrawTapPoint = useCallback(
+    (lat: number, lng: number) => {
+      const hit = editorSnapEnabled
+        ? findNearestRoadSnap({ lat, lng }, editorDraftRoadsRef.current, 16)
+        : null;
+      const chosen = hit ? hit.point : { lat, lng };
+      setEditorDrawPoints((prev) => [
+        ...prev,
+        { lat: chosen.lat, lng: chosen.lng, accuracy: 1.5, timestamp: Date.now() },
+      ]);
+    },
+    [editorSnapEnabled]
+  );
+
+  const handleEditorUndo = useCallback(() => {
+    if (editorDrawPoints.length > 0) {
+      setEditorDrawPoints((prev) => prev.slice(0, -1));
+      return;
+    }
+    if (editorHistory.length === 0) return;
+    const prevState = editorHistory[editorHistory.length - 1];
+    const current = cloneRoadsSnapshot(editorDraftRoadsRef.current);
+    setEditorFuture((f) => [...f, current]);
+    setEditorHistory((h) => h.slice(0, -1));
+    setEditorDraftRoads(prevState);
+  }, [editorDrawPoints.length, editorHistory, cloneRoadsSnapshot]);
+
+  const handleEditorRedo = useCallback(() => {
+    if (editorFuture.length === 0) return;
+    const nextState = editorFuture[editorFuture.length - 1];
+    const current = cloneRoadsSnapshot(editorDraftRoadsRef.current);
+    setEditorHistory((h) => [...h, current]);
+    setEditorFuture((f) => f.slice(0, -1));
+    setEditorDraftRoads(nextState);
+  }, [editorFuture, cloneRoadsSnapshot]);
+
+  const editorAmxAheadTarget: AheadRoadTarget | null = useMemo(() => {
+    if (!editorEnabled || !editorAmxActive) return null;
+    const walked = computePathDistance([...editorAmxPoints, editorAmxCursor]);
+    return findAheadRoadTarget(editorAmxCursor, editorAmxCursor.headingDeg, editorDraftRoads, {
+      anchorRoadId: editorAmxAnchor?.roadId ?? null,
+      anchorOrigin: editorAmxPoints[0] ?? null,
+      walkedMeters: walked,
+      maxRangeMeters: 95,
+    });
+  }, [
+    editorEnabled,
+    editorAmxActive,
+    editorAmxCursor,
+    editorAmxPoints,
+    editorDraftRoads,
+    editorAmxAnchor,
+  ]);
+
+  // Editor AutoMap Virtual Drive Engine (auto-moves from clicked Bindu & slows/pauses cleanly on upcoming target)
+  useEffect(() => {
+    if (
+      mode !== 'preview' ||
+      !editorEnabled ||
+      !editorAmxActive ||
+      !editorAmxRunning ||
+      editorAmxPaused ||
+      editorAmxLiveGps
+    ) {
+      return;
+    }
+
+    editorAmxLastTickRef.current = Date.now();
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const dt = Math.min(0.6, Math.max(0.05, (now - editorAmxLastTickRef.current) / 1000));
+      editorAmxLastTickRef.current = now;
+
+      const cur = editorAmxCursorRef.current;
+      const stepM = editorAmxSpeedRef.current * dt;
+      if (stepM <= 0.01) return;
+
+      const moved = offsetCoord(cur, cur.headingDeg, stepM);
+      const nextCur = { lat: moved.lat, lng: moved.lng, headingDeg: cur.headingDeg };
+
+      const prevPts = editorAmxPointsRef.current;
+      const walked = computePathDistance([...prevPts, nextCur]);
+      const ahead = findAheadRoadTarget(nextCur, nextCur.headingDeg, editorDraftRoadsRef.current, {
+        anchorRoadId: editorAmxAnchorRef.current?.roadId ?? null,
+        anchorOrigin: prevPts[0] ?? null,
+        walkedMeters: walked,
+        maxRangeMeters: 95,
+      });
+
+      const targetKey = ahead ? `${ahead.roadId}:${ahead.segIndex}` : null;
+      if (
+        walked >= 7 &&
+        ahead &&
+        ahead.distMeters <= 3.8 &&
+        targetKey &&
+        editorAmxAutoPausedAtRef.current !== targetKey
+      ) {
+        editorAmxAutoPausedAtRef.current = targetKey;
+        const snappedCur = {
+          lat: ahead.lat,
+          lng: ahead.lng,
+          headingDeg: nextCur.headingDeg,
+        };
+        editorAmxCursorRef.current = snappedCur;
+        setEditorAmxCursor(snappedCur);
+        const snappedPts = [
+          ...prevPts,
+          { lat: ahead.lat, lng: ahead.lng, accuracy: 1.5, timestamp: now },
+        ];
+        editorAmxPointsRef.current = snappedPts;
+        setEditorAmxPoints(snappedPts);
+        setEditorAmxPaused(true);
+        return;
+      }
+
+      editorAmxCursorRef.current = nextCur;
+      setEditorAmxCursor(nextCur);
+
+      const lastPt = prevPts[prevPts.length - 1];
+      if (!lastPt || haversineMeters(lastPt, nextCur) >= 1.5) {
+        const nextPts = [
+          ...prevPts,
+          { lat: nextCur.lat, lng: nextCur.lng, accuracy: 1.5, timestamp: now },
+        ];
+        editorAmxPointsRef.current = nextPts;
+        setEditorAmxPoints(nextPts);
+      }
+
+      if (autoFollowGpsRef.current) {
+        setFocusTarget({ lat: nextCur.lat, lng: nextCur.lng, key: now });
+      }
+    }, 200);
+
+    return () => clearInterval(timer);
+  }, [mode, editorEnabled, editorAmxActive, editorAmxRunning, editorAmxPaused, editorAmxLiveGps]);
+
+  // Editor AutoMap Live GPS Watcher ("Jo live per bhi hota hai")
+  useEffect(() => {
+    if (mode !== 'preview' || !editorEnabled || !editorAmxActive || !editorAmxLiveGps) {
+      if (editorAmxWatchIdRef.current !== null && 'geolocation' in navigator) {
+        navigator.geolocation.clearWatch(editorAmxWatchIdRef.current);
+        editorAmxWatchIdRef.current = null;
+      }
+      return;
+    }
+    if (!('geolocation' in navigator)) return;
+
+    gpsSmootherRef.current.reset();
+    editorAmxWatchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const now = pos.timestamp || Date.now();
+        const rawPt: LatLngPoint = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          timestamp: now,
+        };
+        const prevGps = editorAmxLastGpsRef.current;
+        const smoothed = gpsSmootherRef.current.update(rawPt, prevGps?.timestamp);
+        const nextH =
+          pos.coords.heading != null &&
+          Number.isFinite(pos.coords.heading) &&
+          pos.coords.speed != null &&
+          pos.coords.speed >= 0.5
+            ? pos.coords.heading
+            : prevGps && haversineMeters(prevGps, smoothed) >= 1.5
+            ? calculateBearing(prevGps, smoothed)
+            : editorAmxCursorRef.current.headingDeg;
+
+        editorAmxLastGpsRef.current = smoothed;
+        setUserLocation(smoothed);
+        if (Number.isFinite(nextH)) setUserHeadingDeg(nextH);
+
+        const nextCur = { lat: smoothed.lat, lng: smoothed.lng, headingDeg: nextH };
+        editorAmxCursorRef.current = nextCur;
+        setEditorAmxCursor(nextCur);
+
+        const prevPts = editorAmxPointsRef.current;
+        const lastPt = prevPts[prevPts.length - 1];
+        if (!lastPt || haversineMeters(lastPt, smoothed) >= 2.0) {
+          const nextPts = [...prevPts, smoothed];
+          editorAmxPointsRef.current = nextPts;
+          setEditorAmxPoints(nextPts);
+        }
+
+        if (autoFollowGpsRef.current) {
+          setFocusTarget({ lat: smoothed.lat, lng: smoothed.lng, key: now });
+        }
+      },
+      () => {
+        // silent fallback if GPS weak indoors
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 12000 }
+    );
+
+    return () => {
+      if (editorAmxWatchIdRef.current !== null && 'geolocation' in navigator) {
+        navigator.geolocation.clearWatch(editorAmxWatchIdRef.current);
+        editorAmxWatchIdRef.current = null;
+      }
+    };
+  }, [mode, editorEnabled, editorAmxActive, editorAmxLiveGps]);
+
+  const handleTapEndpointForAutoMap = useCallback(
+    (roadId: string, end: 'start' | 'end', lat: number, lng: number) => {
+      const road = editorDraftRoadsRef.current.find((r) => r.id === roadId);
+      if (!road || road.points.length < 2) return;
+
+      const pts = road.points;
+      const headingDeg =
+        end === 'end'
+          ? calculateBearing(pts[pts.length - 2], pts[pts.length - 1])
+          : calculateBearing(pts[1], pts[0]);
+
+      const startPt: LatLngPoint = {
+        lat,
+        lng,
+        accuracy: 1.5,
+        timestamp: Date.now(),
+      };
+      const initCur = { lat, lng, headingDeg };
+      editorAmxAnchorRef.current = { roadId, end };
+      setEditorAmxAnchor({ roadId, end });
+      editorAmxPointsRef.current = [startPt];
+      setEditorAmxPoints([startPt]);
+      editorAmxCursorRef.current = initCur;
+      setEditorAmxCursor(initCur);
+      editorAmxAutoPausedAtRef.current = null;
+      editorAmxLastTickRef.current = Date.now();
+      setEditorActiveRoadId(roadId);
+      setEditorTool('automap');
+      setEditorAmxLiveGps(false);
+      setEditorAmxActive(true);
+      setEditorAmxRunning(true);
+      setEditorAmxPaused(false);
+      autoFollowGpsRef.current = true;
+      setIsFollowingGps(true);
+      setFocusTarget({
+        lat,
+        lng,
+        zoom: mapViewRef.current.zoom < 18 ? 19 : undefined,
+        key: Date.now(),
+      });
+    },
+    []
+  );
+
+  const handleEditorAmxSymbolAction = useCallback((action: AutoMapXSymbolAction) => {
+    const cur = editorAmxCursorRef.current;
+    const now = Date.now();
+    const prevPts = editorAmxPointsRef.current;
+    const lastPt = prevPts[prevPts.length - 1];
+    const basePts =
+      !lastPt || haversineMeters(lastPt, cur) >= 0.4
+        ? [...prevPts, { lat: cur.lat, lng: cur.lng, accuracy: 1.5, timestamp: now }]
+        : prevPts;
+
+    if (action === 'straight_step') {
+      const moved = offsetCoord(cur, cur.headingDeg, 5);
+      const nextCur = { lat: moved.lat, lng: moved.lng, headingDeg: cur.headingDeg };
+      editorAmxCursorRef.current = nextCur;
+      setEditorAmxCursor(nextCur);
+      const nextPts = [
+        ...basePts,
+        { lat: nextCur.lat, lng: nextCur.lng, accuracy: 1.5, timestamp: now },
+      ];
+      editorAmxPointsRef.current = nextPts;
+      setEditorAmxPoints(nextPts);
+      setFocusTarget({ lat: nextCur.lat, lng: nextCur.lng, key: now });
+      return;
+    }
+
+    if (action === 'curve_left' || action === 'curve_right') {
+      const totalDelta = action === 'curve_left' ? -45 : 45;
+      const steps = 5;
+      let pos: { lat: number; lng: number } = { lat: cur.lat, lng: cur.lng };
+      const added: LatLngPoint[] = [];
+      for (let k = 1; k <= steps; k++) {
+        const h = (cur.headingDeg + (totalDelta * k) / steps + 360) % 360;
+        pos = offsetCoord(pos, h, 1.5);
+        added.push({ lat: pos.lat, lng: pos.lng, accuracy: 1.5, timestamp: now + k });
+      }
+      const nextCur = {
+        lat: pos.lat,
+        lng: pos.lng,
+        headingDeg: (cur.headingDeg + totalDelta + 360) % 360,
+      };
+      editorAmxCursorRef.current = nextCur;
+      setEditorAmxCursor(nextCur);
+      const nextPts = [...basePts, ...added];
+      editorAmxPointsRef.current = nextPts;
+      setEditorAmxPoints(nextPts);
+      setFocusTarget({ lat: nextCur.lat, lng: nextCur.lng, key: now });
+      return;
+    }
+
+    const deltaMap: Partial<Record<AutoMapXSymbolAction, number>> = {
+      nudge_left_5: -5,
+      nudge_right_5: 5,
+      nudge_left_15: -15,
+      nudge_right_15: 15,
+      slight_left: -30,
+      slight_right: 30,
+      turn_left: -90,
+      turn_right: 90,
+      u_turn: 180,
+    };
+    const delta = deltaMap[action];
+    if (delta != null) {
+      const nextH = (cur.headingDeg + delta + 360) % 360;
+      const nextCur = { ...cur, headingDeg: nextH };
+      editorAmxCursorRef.current = nextCur;
+      setEditorAmxCursor(nextCur);
+      editorAmxPointsRef.current = basePts;
+      setEditorAmxPoints(basePts);
+    }
+  }, []);
+
+  const handleEditorAmxAlignToTarget = useCallback(() => {
+    if (!editorAmxAheadTarget) return;
+    const cur = editorAmxCursorRef.current;
+    const brg = calculateBearing(cur, editorAmxAheadTarget);
+    const nextCur = { ...cur, headingDeg: brg };
+    editorAmxCursorRef.current = nextCur;
+    setEditorAmxCursor(nextCur);
+  }, [editorAmxAheadTarget]);
+
+  const handleEditorAmxRewindStep = useCallback(() => {
+    const pts = editorAmxPointsRef.current;
+    if (pts.length <= 1) return;
+    let accum = 0;
+    let cutIdx = pts.length - 2;
+    for (let i = pts.length - 1; i >= 1; i--) {
+      accum += haversineMeters(pts[i - 1], pts[i]);
+      cutIdx = i - 1;
+      if (accum >= 10) break;
+    }
+    const kept = pts.slice(0, Math.max(1, cutIdx + 1));
+    const last = kept[kept.length - 1];
+    const prev = kept[Math.max(0, kept.length - 2)];
+    const h =
+      kept.length >= 2 && haversineMeters(prev, last) >= 0.3
+        ? calculateBearing(prev, last)
+        : editorAmxCursorRef.current.headingDeg;
+    const nextCur = { lat: last.lat, lng: last.lng, headingDeg: h };
+    editorAmxPointsRef.current = kept;
+    setEditorAmxPoints(kept);
+    editorAmxCursorRef.current = nextCur;
+    setEditorAmxCursor(nextCur);
+    editorAmxAutoPausedAtRef.current = null;
+    setFocusTarget({ lat: nextCur.lat, lng: nextCur.lng, key: Date.now() });
+  }, []);
+
+  const handleEditorAmxJoinAndFinish = useCallback(() => {
+    const anchor = editorAmxAnchorRef.current;
+    if (!anchor) return;
+    const cur = editorAmxCursorRef.current;
+    const pts = editorAmxPointsRef.current;
+    const last = pts[pts.length - 1];
+    const fullPts =
+      !last || haversineMeters(last, cur) >= 0.4
+        ? [...pts, { lat: cur.lat, lng: cur.lng, accuracy: 1.5, timestamp: Date.now() }]
+        : pts;
+    if (fullPts.length < 2) {
+      resetEditorAmx();
+      setEditorTool('pan');
+      return;
+    }
+
+    const before = cloneRoadsSnapshot(editorDraftRoadsRef.current);
+    const { nextRoads, selectedRoadId } = commitEditorAutoMapJoin(before, anchor, fullPts, {
+      aheadTarget: editorAmxAheadTarget,
+      snapRadiusMeters: 24,
+    });
+    setEditorHistory((h) => [...h, before]);
+    setEditorFuture([]);
+    setEditorDraftRoads(nextRoads);
+    if (selectedRoadId) setEditorActiveRoadId(selectedRoadId);
+    resetEditorAmx();
+    setEditorTool('pan');
+  }, [cloneRoadsSnapshot, editorAmxAheadTarget, resetEditorAmx]);
+
+  const editorAmxDistanceMeters = useMemo(() => {
+    if (!editorAmxActive || editorAmxPoints.length === 0) return 0;
+    return computePathDistance([...editorAmxPoints, editorAmxCursor]);
+  }, [editorAmxActive, editorAmxPoints, editorAmxCursor]);
+
+  const editorSnapPreview = useMemo(() => {
+    if (!editorEnabled || editorTool !== 'draw' || !editorSnapEnabled) return null;
+    const probe = editorHoverPt ?? editorDrawPoints[editorDrawPoints.length - 1] ?? null;
+    if (!probe) return null;
+    const hit = findNearestRoadSnap(probe, editorDraftRoads, 16);
+    return hit ? { lat: hit.point.lat, lng: hit.point.lng, roadName: hit.roadName } : null;
+  }, [editorEnabled, editorTool, editorSnapEnabled, editorHoverPt, editorDrawPoints, editorDraftRoads]);
+
+  const previewRoadEditorUi: PreviewRoadEditorUi = useMemo(
+    () => ({
+      enabled: editorEnabled,
+      tool: editorTool,
+      activeRoadId: editorActiveRoadId,
+      editAllScope: editorEditAllScope,
+      eraserRadiusMeters: editorEraserRadius,
+      snapEnabled: editorSnapEnabled,
+      canUndo: editorHistory.length > 0 || editorDrawPoints.length > 0,
+      canRedo: editorFuture.length > 0,
+      undoCount: editorHistory.length + (editorDrawPoints.length > 0 ? 1 : 0),
+      hasUnsavedChanges: editorHistory.length > 0,
+      drawingPoints: editorDrawPoints,
+      snapRoadName: editorSnapPreview?.roadName ?? null,
+      draftRoads: editorDraftRoads,
+      autoMap: {
+        active: editorAmxActive,
+        isRunning: editorAmxRunning,
+        isPaused: editorAmxPaused,
+        useLiveGps: editorAmxLiveGps,
+        speedMps: editorAmxSpeedMps,
+        distanceMeters: editorAmxDistanceMeters,
+        pointsCount:
+          editorAmxPoints.length +
+          (editorAmxPoints.length > 0 &&
+          haversineMeters(editorAmxPoints[editorAmxPoints.length - 1], editorAmxCursor) >= 0.4
+            ? 1
+            : 0),
+        aheadTarget: editorAmxAheadTarget
+          ? {
+              roadName: editorAmxAheadTarget.roadName,
+              distMeters: editorAmxAheadTarget.distMeters,
+              isEndpoint: editorAmxAheadTarget.isEndpoint,
+              turnDeltaDeg: editorAmxAheadTarget.turnDeltaDeg,
+            }
+          : null,
+        onPauseResume: () => setEditorAmxPaused((p) => !p),
+        onToggleLiveGps: () =>
+          setEditorAmxLiveGps((v) => {
+            const next = !v;
+            if (next) {
+              setEditorAmxPaused(false);
+            }
+            return next;
+          }),
+        onSetSpeedMps: setEditorAmxSpeedMps,
+        onSymbolAction: handleEditorAmxSymbolAction,
+        onAlignToAheadTarget: handleEditorAmxAlignToTarget,
+        onRewindStep: handleEditorAmxRewindStep,
+        onJoinAndFinish: handleEditorAmxJoinAndFinish,
+        onCancelAutoMap: () => {
+          resetEditorAmx();
+          setEditorTool('pan');
+        },
+      },
+      onStartEdit: handleStartRoadEdit,
+      onCancelEdit: handleCancelRoadEdit,
+      onSaveEdit: handleSaveRoadEdit,
+      onSetTool: (tool) => {
+        if (editorAmxActive) return;
+        setEditorTool(tool);
+        if (tool !== 'draw') setEditorDrawPoints([]);
+      },
+      onSetActiveRoadId: setEditorActiveRoadId,
+      onToggleEditAllScope: () => setEditorEditAllScope((v) => !v),
+      onSetEraserRadius: setEditorEraserRadius,
+      onToggleSnap: () => setEditorSnapEnabled((v) => !v),
+      onUndo: handleEditorUndo,
+      onRedo: handleEditorRedo,
+      onFinishDrawTapChain: () => commitDrawnStroke(editorDrawPoints),
+      onDiscardDrawTapChain: () => setEditorDrawPoints([]),
+    }),
+    [
+      editorEnabled,
+      editorTool,
+      editorActiveRoadId,
+      editorEditAllScope,
+      editorEraserRadius,
+      editorSnapEnabled,
+      editorHistory.length,
+      editorFuture.length,
+      editorDrawPoints,
+      editorSnapPreview?.roadName,
+      editorDraftRoads,
+      editorAmxActive,
+      editorAmxRunning,
+      editorAmxPaused,
+      editorAmxLiveGps,
+      editorAmxSpeedMps,
+      editorAmxDistanceMeters,
+      editorAmxPoints,
+      editorAmxCursor,
+      editorAmxAheadTarget,
+      handleEditorAmxSymbolAction,
+      handleEditorAmxAlignToTarget,
+      handleEditorAmxRewindStep,
+      handleEditorAmxJoinAndFinish,
+      resetEditorAmx,
+      handleStartRoadEdit,
+      handleCancelRoadEdit,
+      handleSaveRoadEdit,
+      handleEditorUndo,
+      handleEditorRedo,
+      commitDrawnStroke,
+    ]
+  );
+
+  const previewMapRoadEditor: RoadEditorConfig | null = useMemo(
+    () =>
+      editorEnabled
+        ? {
+            enabled: true,
+            tool: editorTool,
+            activeRoadId: editorActiveRoadId,
+            eraserRadiusMeters: editorEraserRadius,
+            snapEnabled: editorSnapEnabled,
+            drawingPoints: editorDrawPoints,
+            snapTarget: editorSnapPreview,
+            autoMapSession: editorAmxActive
+              ? {
+                  active: true,
+                  isRunning: editorAmxRunning,
+                  isPaused: editorAmxPaused,
+                  useLiveGps: editorAmxLiveGps,
+                  points: editorAmxPoints,
+                  cursor: editorAmxCursor,
+                  aheadTarget: editorAmxAheadTarget
+                    ? {
+                        lat: editorAmxAheadTarget.lat,
+                        lng: editorAmxAheadTarget.lng,
+                        distMeters: editorAmxAheadTarget.distMeters,
+                        roadName: editorAmxAheadTarget.roadName,
+                        isEndpoint: editorAmxAheadTarget.isEndpoint,
+                        turnDeltaDeg: editorAmxAheadTarget.turnDeltaDeg,
+                      }
+                    : null,
+                }
+              : null,
+            onSelectRoad: setEditorActiveRoadId,
+            onTapEndpointForAutoMap: handleTapEndpointForAutoMap,
+            onEraseStrokeStart: handleEraseStrokeStart,
+            onEraseAt: handleEraseAt,
+            onEraseStrokeEnd: handleEraseStrokeEnd,
+            onDrawTapPoint: handleDrawTapPoint,
+            onDrawFreehandStroke: commitDrawnStroke,
+            onPointerHover: (lat, lng) => setEditorHoverPt({ lat, lng }),
+          }
+        : null,
+    [
+      editorEnabled,
+      editorTool,
+      editorActiveRoadId,
+      editorEraserRadius,
+      editorSnapEnabled,
+      editorDrawPoints,
+      editorSnapPreview,
+      editorAmxActive,
+      editorAmxRunning,
+      editorAmxPaused,
+      editorAmxLiveGps,
+      editorAmxPoints,
+      editorAmxCursor,
+      editorAmxAheadTarget,
+      handleTapEndpointForAutoMap,
+      handleEraseStrokeStart,
+      handleEraseAt,
+      handleEraseStrokeEnd,
+      handleDrawTapPoint,
+      commitDrawnStroke,
+    ]
+  );
+
   const interactionMode: MapInteractionMode = useMemo(() => {
     if (isPickingSpot) return 'pick_user_location';
     if (mode === 'automapx' && amxSubMode === 'build' && amxPickingStart && !amxIsRunning) {
@@ -3005,9 +3934,12 @@ export default function App() {
       return;
     }
     if (interactionMode === 'pick_automapx_start') {
+      // Snap automatically onto any existing saved road (even mid-segment A–B) within 14m!
+      const snapHit = findNearestRoadSnap({ lat, lng }, roads, 14);
+      const startCoord = snapHit ? snapHit.point : { lat, lng };
       const nextCur = {
-        lat: Number(lat.toFixed(7)),
-        lng: Number(lng.toFixed(7)),
+        lat: Number(startCoord.lat.toFixed(7)),
+        lng: Number(startCoord.lng.toFixed(7)),
         headingDeg: amxCursorRef.current.headingDeg,
       };
       amxCursorRef.current = nextCur;
@@ -3020,20 +3952,24 @@ export default function App() {
         headingDeg: nextCur.headingDeg,
         cumulativeMeters: 0,
         speedMps: amxSpeedRef.current,
-        momentLabel: 'Start',
+        momentLabel: snapHit ? `Start (${snapHit.roadName})` : 'Start',
       };
       amxPointsRef.current = [startNode];
       setAmxPoints([startNode]);
       amxTotalMetersRef.current = 0;
-      maybeDetectVillage(lat, lng);
-      showToast('AutoMapX start placed on map! Set speed & tap Start.');
+      maybeDetectVillage(startCoord.lat, startCoord.lng);
       return;
     }
     if (interactionMode === 'manual_trace') {
+      const snapHit = findNearestRoadSnap({ lat, lng }, roads, 14);
+      const chosen = snapHit ? snapHit.point : { lat, lng };
       setWalkSegments((prev) => {
         const next = prev.length > 0 ? [...prev] : [[]];
         const lastIdx = next.length - 1;
-        next[lastIdx] = [...next[lastIdx], { lat, lng, timestamp: Date.now() }];
+        next[lastIdx] = [
+          ...next[lastIdx],
+          { lat: chosen.lat, lng: chosen.lng, timestamp: Date.now() },
+        ];
         return next;
       });
       return;
@@ -3046,7 +3982,6 @@ export default function App() {
       setNavOrigin({ lat, lng });
       setIsPickingSpot(false);
       maybeDetectVillage(lat, lng);
-      showToast('Updated your location spot on the map.');
     }
   };
 
@@ -3054,7 +3989,7 @@ export default function App() {
 
   const previewMapElement = (
     <VillageMap
-      roads={roads}
+      roads={editorEnabled ? editorDraftRoads : roads}
       houses={houses}
       draftHouses={[]}
       activeWalkSegments={[]}
@@ -3062,11 +3997,11 @@ export default function App() {
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
-      routeResult={previewRouteResult}
-      alternativeRoutes={previewRouteOptions}
+      routeResult={editorEnabled ? null : previewRouteResult}
+      alternativeRoutes={editorEnabled ? [] : previewRouteOptions}
       liveProgress={null}
-      startHouse={previewFromHouse}
-      targetHouse={previewToHouse}
+      startHouse={editorEnabled ? null : previewFromHouse}
+      targetHouse={editorEnabled ? null : previewToHouse}
       darkMode={theme === 'dark'}
       isolateNavigation={false}
       activeInstruction={null}
@@ -3087,6 +4022,7 @@ export default function App() {
         setIsFollowingGps(false);
       }}
       focusTarget={focusTarget}
+      roadEditor={previewMapRoadEditor}
     />
   );
 
@@ -3192,6 +4128,16 @@ export default function App() {
         setIsFollowingGps(false);
       }}
       focusTarget={focusTarget}
+      liveRoadSnap={
+        mode === 'add' && walkNearestSnap
+          ? {
+              lat: walkNearestSnap.point.lat,
+              lng: walkNearestSnap.point.lng,
+              roadName: walkNearestSnap.roadName,
+              distMeters: walkNearestSnap.distMeters,
+            }
+          : null
+      }
     />
   );
 
@@ -3264,191 +4210,623 @@ export default function App() {
       }}
       focusTarget={focusTarget}
       autoMapXOverlay={autoMapXOverlay}
+      liveRoadSnap={
+        mode === 'automapx' && amxSubMode === 'build' && amxNearestSnap
+          ? {
+              lat: amxNearestSnap.point.lat,
+              lng: amxNearestSnap.point.lng,
+              roadName: amxNearestSnap.roadName,
+              distMeters: amxNearestSnap.distMeters,
+            }
+          : null
+      }
     />
   );
 
+  // Stable tour waypoints (recomputes ONLY when road geometries change, not when segmentAccess stamps)
+  const roadsTourRef = useRef(roads);
+  roadsTourRef.current = roads;
+  const roadGeometrySig = useMemo(
+    () =>
+      roads
+        .map(
+          (r) =>
+            `${r.id}:${r.points.length}:${r.points[0]?.lat ?? 0},${r.points[0]?.lng ?? 0}:${
+              r.points[r.points.length - 1]?.lat ?? 0
+            },${r.points[r.points.length - 1]?.lng ?? 0}`
+        )
+        .join('|'),
+    [roads]
+  );
+  const vehTourWaypoints: VehicleTourWaypoint[] = useMemo(
+    () => buildVehicleTourWaypoints(roadsTourRef.current, 2),
+    [roadGeometrySig]
+  );
+  const vehHierarchySummary = useMemo(() => summarizeVehicleHierarchy(roads), [roads]);
+
+  const stampSegmentIfChanged = useCallback(
+    (roadId: string, segIndex: number, access: VehicleSegmentAccess) => {
+      setRoads((prev) => {
+        const target = prev.find((r) => r.id === roadId);
+        if (!target || target.points.length < 2) return prev;
+        if (target.segmentAccess?.[segIndex] === access && target.roadRole) {
+          return prev;
+        }
+        return stampRoadSegmentAccess(prev, roadId, segIndex, access);
+      });
+    },
+    []
+  );
+
+  // Stop vehicle playback if leaving vehicles mode
+  useEffect(() => {
+    if (mode !== 'vehicles' && vehIsPlaying) {
+      setVehIsPlaying(false);
+    }
+  }, [mode, vehIsPlaying]);
+
+  // Vehicle Simulator Playback Loop
+  useEffect(() => {
+    if (mode !== 'vehicles' || !vehIsPlaying || vehTourWaypoints.length < 2) return;
+
+    const intervalMs: Record<VehicleSimSpeed, number> = {
+      0.25: 1350,
+      0.5: 700,
+      1: 360,
+      2: 180,
+      4: 90,
+    };
+
+    const timer = setInterval(() => {
+      setVehIdx((prev) => {
+        const next = prev + 1;
+        if (next >= vehTourWaypoints.length) {
+          setVehIsPlaying(false);
+          return vehTourWaypoints.length - 1;
+        }
+        const wp = vehTourWaypoints[next];
+        if (wp) {
+          stampSegmentIfChanged(wp.roadId, wp.segIndex, vehCarOnRef.current ? 'car' : 'no_car');
+          if (vehAutoFollowRef.current) {
+            setFocusTarget({ lat: wp.lat, lng: wp.lng, key: Date.now() });
+          }
+        }
+        if (next >= vehTourWaypoints.length - 1) {
+          setVehIsPlaying(false);
+        }
+        return next;
+      });
+    }, intervalMs[vehSpeed]);
+
+    return () => clearInterval(timer);
+  }, [mode, vehIsPlaying, vehTourWaypoints, vehSpeed, stampSegmentIfChanged]);
+
+  const handleVehSetCarOn = useCallback(
+    (nextOn: boolean) => {
+      setVehCarOn(nextOn);
+      const wp = vehTourWaypoints[Math.min(vehIdx, Math.max(0, vehTourWaypoints.length - 1))];
+      if (wp) {
+        stampSegmentIfChanged(wp.roadId, wp.segIndex, nextOn ? 'car' : 'no_car');
+      }
+    },
+    [vehTourWaypoints, vehIdx, stampSegmentIfChanged]
+  );
+
+  const handleVehJumpIndex = useCallback(
+    (idx: number) => {
+      if (vehTourWaypoints.length === 0) return;
+      const clamped = Math.max(0, Math.min(idx, vehTourWaypoints.length - 1));
+      setVehIdx(clamped);
+      const wp = vehTourWaypoints[clamped];
+      if (wp && vehAutoFollowRef.current) {
+        setFocusTarget({ lat: wp.lat, lng: wp.lng, key: Date.now() });
+      }
+    },
+    [vehTourWaypoints]
+  );
+
+  const handleVehJumpToRoad = useCallback(
+    (roadId: string) => {
+      const targetIdx = vehTourWaypoints.findIndex((wp) => wp.roadId === roadId);
+      if (targetIdx < 0) return;
+      setVehIsPlaying(false);
+      setVehIdx(targetIdx);
+      const wp = vehTourWaypoints[targetIdx];
+      if (wp) {
+        setFocusTarget({
+          lat: wp.lat,
+          lng: wp.lng,
+          zoom: mapViewRef.current.zoom < 18 ? 18 : undefined,
+          key: Date.now(),
+        });
+      }
+    },
+    [vehTourWaypoints]
+  );
+
+  const handleVehPrevNextRoad = useCallback(
+    (dir: -1 | 1) => {
+      if (vehTourWaypoints.length === 0) return;
+      const roadStarts: number[] = [];
+      let lastRoadId = '';
+      for (let i = 0; i < vehTourWaypoints.length; i++) {
+        if (vehTourWaypoints[i].roadId !== lastRoadId) {
+          roadStarts.push(i);
+          lastRoadId = vehTourWaypoints[i].roadId;
+        }
+      }
+      if (roadStarts.length <= 1) return;
+      const curWp = vehTourWaypoints[Math.min(vehIdx, vehTourWaypoints.length - 1)];
+      const curRoadOrderIdx = roadStarts.findIndex(
+        (startIdx) => vehTourWaypoints[startIdx].roadId === curWp.roadId
+      );
+      const nextOrderIdx = (curRoadOrderIdx + dir + roadStarts.length) % roadStarts.length;
+      const nextStartIdx = roadStarts[nextOrderIdx];
+      setVehIsPlaying(false);
+      setVehIdx(nextStartIdx);
+      const wp = vehTourWaypoints[nextStartIdx];
+      if (wp) {
+        setFocusTarget({ lat: wp.lat, lng: wp.lng, key: Date.now() });
+      }
+    },
+    [vehTourWaypoints, vehIdx]
+  );
+
+  const activeVehWp =
+    vehTourWaypoints.length > 0
+      ? vehTourWaypoints[Math.min(vehIdx, vehTourWaypoints.length - 1)]
+      : null;
+
+  const vehicleOverlayConfig: VehicleOverlayConfig | null = useMemo(() => {
+    if (mode !== 'vehicles') return null;
+    return {
+      active: true,
+      carOn: vehCarOn,
+      currentRoadId: activeVehWp?.roadId ?? null,
+      simPoint: activeVehWp
+        ? { lat: activeVehWp.lat, lng: activeVehWp.lng, headingDeg: activeVehWp.bearingDeg }
+        : null,
+      onSelectRoad: handleVehJumpToRoad,
+    };
+  }, [mode, vehCarOn, activeVehWp, handleVehJumpToRoad]);
+
+  const cleanMapElement = (
+    <VillageMap
+      roads={roads}
+      houses={[]}
+      draftHouses={[]}
+      activeWalkSegments={[]}
+      draftJunctions={[]}
+      currentGps={userLocation}
+      userHeadingDeg={userHeadingDeg}
+      gpsQuality={gpsQuality}
+      routeResult={null}
+      alternativeRoutes={[]}
+      liveProgress={null}
+      targetHouse={null}
+      darkMode={theme === 'dark'}
+      isolateNavigation={false}
+      activeInstruction={null}
+      distanceToNextTurnMeters={null}
+      interactionMode="browse"
+      onMapClick={() => {}}
+      onNavigateHouse={startNavigateToHouse}
+      onCenterGps={() => handleFitAllRoadsOnly()}
+      isFollowingGps={false}
+      initialView={mapViewRef.current}
+      onViewChange={(view) => {
+        mapViewRef.current = view;
+      }}
+      focusTarget={focusTarget}
+      hideHouses={true}
+      hideGpsMarker={mapCleanScreen}
+      cleanScreen={mapCleanScreen}
+      showVehicleHierarchy={true}
+    />
+  );
+
+  const vehiclesMapElement = (
+    <VillageMap
+      roads={roads}
+      houses={houses}
+      draftHouses={[]}
+      activeWalkSegments={[]}
+      draftJunctions={[]}
+      currentGps={userLocation}
+      userHeadingDeg={userHeadingDeg}
+      gpsQuality={gpsQuality}
+      routeResult={null}
+      alternativeRoutes={[]}
+      liveProgress={null}
+      targetHouse={null}
+      darkMode={theme === 'dark'}
+      isolateNavigation={false}
+      activeInstruction={null}
+      distanceToNextTurnMeters={null}
+      interactionMode="browse"
+      onMapClick={() => {}}
+      onNavigateHouse={startNavigateToHouse}
+      onCenterGps={() => handleFitAllRoadsOnly()}
+      isFollowingGps={vehAutoFollow}
+      initialView={mapViewRef.current}
+      onViewChange={(view) => {
+        mapViewRef.current = view;
+      }}
+      onUserDrag={() => setVehAutoFollow(false)}
+      focusTarget={focusTarget}
+      showVehicleHierarchy={true}
+      vehicleOverlay={vehicleOverlayConfig}
+    />
+  );
+
+  const isPureRecordingScreen = mode === 'map' && mapCleanScreen;
+
   return (
     <div className="h-[100dvh] w-screen flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
-      {/* Clean Top Header — GramPath + Saved Searched Areas Bar */}
-      <header className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-3 sm:px-5 h-11 flex items-center justify-between gap-2 z-[520] relative">
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          <span className="text-sm sm:text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
-            GramPath
-          </span>
+      {/* Clean Top Header — GramPath + Saved Areas + Map + Vehicles */}
+      {!isPureRecordingScreen && (
+        <header className="shrink-0 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-2 sm:px-5 h-11 flex items-center justify-between gap-1.5 z-[520] relative">
+          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1">
+            <span className="text-sm sm:text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
+              GramPath
+            </span>
 
-          {/* Saved Searched Areas beside GramPath so users don't repeat area search next visit */}
-          <div className="relative flex items-center gap-1 min-w-0">
-            <button
-              type="button"
-              onClick={() => setSavedAreasMenuOpen((v) => !v)}
-              title="Saved Areas (click to switch or pin current area)"
-              className={`h-7 px-2 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors max-w-[140px] sm:max-w-[180px] ${
-                savedAreas.length > 0
-                  ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
-                  : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-              }`}
-            >
-              <Bookmark className="w-3 h-3 shrink-0" />
-              <span className="truncate">
-                {savedAreas.find((a) => a.id === activeSavedAreaId)?.name ??
-                  savedAreas[0]?.name ??
-                  'Saved Areas'}
-              </span>
-              {savedAreas.length > 0 && (
-                <span className="px-1 rounded bg-emerald-700 text-white text-[9px] font-mono tabular-nums shrink-0">
-                  {savedAreas.length}
+            {/* Saved Searched Areas beside GramPath */}
+            <div className="relative flex items-center gap-1 min-w-0">
+              <button
+                type="button"
+                onClick={() => setSavedAreasMenuOpen((v) => !v)}
+                title="Saved Areas (click to switch or pin current area)"
+                className={`h-7 px-1.5 sm:px-2 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors max-w-[92px] sm:max-w-[165px] ${
+                  savedAreas.length > 0
+                    ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
+                    : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+                }`}
+              >
+                <Bookmark className="w-3 h-3 shrink-0" />
+                <span className="truncate">
+                  {savedAreas.find((a) => a.id === activeSavedAreaId)?.name ??
+                    savedAreas[0]?.name ??
+                    'Areas'}
                 </span>
-              )}
-              <ChevronDown className="w-3 h-3 shrink-0 opacity-70" />
-            </button>
+                {savedAreas.length > 0 && (
+                  <span className="hidden sm:inline px-1 rounded bg-emerald-700 text-white text-[9px] font-mono tabular-nums shrink-0">
+                    {savedAreas.length}
+                  </span>
+                )}
+                <ChevronDown className="w-3 h-3 shrink-0 opacity-70" />
+              </button>
 
-            {/* Quick 1-tap area buttons in empty desktop header space */}
-            <div className="hidden md:flex items-center gap-1 min-w-0 overflow-hidden">
-              {savedAreas.slice(0, 3).map((area) => {
-                const isActive = area.id === activeSavedAreaId;
-                return (
-                  <button
-                    key={area.id}
-                    type="button"
-                    onClick={() => handleJumpToSavedArea(area)}
-                    title={area.displayName}
-                    className={`h-7 px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 max-w-[130px] cursor-pointer transition-colors shrink-0 ${
-                      isActive
-                        ? 'bg-slate-900 dark:bg-sky-700 text-white border-slate-900 dark:border-sky-700'
-                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700'
-                    }`}
-                  >
-                    <MapPin className="w-3 h-3 shrink-0 opacity-80" />
-                    <span className="truncate">{area.name}</span>
-                  </button>
-                );
-              })}
+              {/* Quick 1-tap area buttons in empty desktop header space */}
+              <div className="hidden lg:flex items-center gap-1 min-w-0 overflow-hidden">
+                {savedAreas.slice(0, 2).map((area) => {
+                  const isActive = area.id === activeSavedAreaId;
+                  return (
+                    <button
+                      key={area.id}
+                      type="button"
+                      onClick={() => handleJumpToSavedArea(area)}
+                      title={area.displayName}
+                      className={`h-7 px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 max-w-[120px] cursor-pointer transition-colors shrink-0 ${
+                        isActive
+                          ? 'bg-slate-900 dark:bg-sky-700 text-white border-slate-900 dark:border-sky-700'
+                          : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      <MapPin className="w-3 h-3 shrink-0 opacity-80" />
+                      <span className="truncate">{area.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {savedAreasMenuOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setSavedAreasMenuOpen(false)}
+                  />
+                  <div className="absolute left-0 top-8 w-64 sm:w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl z-50 overflow-hidden">
+                    <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 bg-slate-50/70 dark:bg-slate-800/60">
+                      <span className="text-[11px] font-bold text-slate-800 dark:text-slate-200">
+                        Saved Areas ({savedAreas.length})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleSaveCurrentViewArea}
+                        className="px-2 py-0.5 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <Plus className="w-3 h-3" />
+                        Save Current
+                      </button>
+                    </div>
+                    {savedAreas.length === 0 ? (
+                      <div className="px-3 py-3 text-[11px] text-slate-500 dark:text-slate-400">
+                        Search any village/area in Navigate or tap &ldquo;Save Current&rdquo; to pin it here for next time.
+                      </div>
+                    ) : (
+                      <div className="max-h-60 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+                        {savedAreas.map((area) => {
+                          const isActive = area.id === activeSavedAreaId;
+                          return (
+                            <div
+                              key={area.id}
+                              className={`flex items-center justify-between gap-2 px-2.5 py-2 ${
+                                isActive
+                                  ? 'bg-emerald-50/80 dark:bg-emerald-950/50'
+                                  : 'hover:bg-slate-50 dark:hover:bg-slate-800/70'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => handleJumpToSavedArea(area)}
+                                className="flex-1 min-w-0 text-left flex items-start gap-2 cursor-pointer"
+                              >
+                                <MapPin
+                                  className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
+                                    isActive
+                                      ? 'text-emerald-700 dark:text-emerald-400'
+                                      : 'text-slate-400'
+                                  }`}
+                                />
+                                <div className="min-w-0">
+                                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                    {area.name}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                                    {area.displayName}
+                                  </div>
+                                </div>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteSavedArea(area.id)}
+                                aria-label={`Remove ${area.name}`}
+                                className="p-1 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded cursor-pointer shrink-0"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
 
-            {savedAreasMenuOpen && (
-              <>
-                <div
-                  className="fixed inset-0 z-40"
-                  onClick={() => setSavedAreasMenuOpen(false)}
+            {/* Top Header Buttons: Roads-Only Clean Map + Vehicles Simulator */}
+            <button
+              type="button"
+              onClick={() => {
+                setMapCleanScreen(false);
+                if (mode === 'map') {
+                  setMode('navigate');
+                } else {
+                  setMode('map');
+                  setTargetHouse(null);
+                  setTimeout(() => handleFitAllRoadsOnly(), 60);
+                }
+              }}
+              title="Full-page Roads Only Map (no houses — great for YouTube & visualization)"
+              className={`h-7 px-2 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
+                mode === 'map'
+                  ? 'bg-blue-700 border-blue-800 text-white shadow-xs'
+                  : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-blue-50 dark:hover:bg-blue-950/50'
+              }`}
+            >
+              <MapIcon className="w-3.5 h-3.5 shrink-0" />
+              <span>Map</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setMapCleanScreen(false);
+                if (mode === 'vehicles') {
+                  setMode('navigate');
+                } else {
+                  setMode('vehicles');
+                  setTargetHouse(null);
+                  setTimeout(() => handleFitAllRoadsOnly(), 60);
+                }
+              }}
+              title="Vehicles Mode: Slow village tour with CAR ON / CAR OFF & automatic Main Road detection"
+              className={`h-7 px-2 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
+                mode === 'vehicles'
+                  ? 'bg-emerald-700 border-emerald-800 text-white shadow-xs'
+                  : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-emerald-50 dark:hover:bg-emerald-950/50'
+              }`}
+            >
+              <Car className="w-3.5 h-3.5 shrink-0" />
+              <span>Vehicles</span>
+            </button>
+
+            {amxIsRunning && mode !== 'automapx' && (
+              <button
+                type="button"
+                onClick={() => setMode('automapx')}
+                className="hidden sm:inline-flex px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-950/70 text-violet-800 dark:text-violet-300 text-[10px] font-semibold items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    amxIsPaused ? 'bg-amber-500' : 'bg-violet-600 animate-pulse'
+                  }`}
                 />
-                <div className="absolute left-0 top-8 w-64 sm:w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl z-50 overflow-hidden">
-                  <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 bg-slate-50/70 dark:bg-slate-800/60">
-                    <span className="text-[11px] font-bold text-slate-800 dark:text-slate-200">
-                      Saved Areas ({savedAreas.length})
-                    </span>
-                    <button
-                      type="button"
-                      onClick={handleSaveCurrentViewArea}
-                      className="px-2 py-0.5 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer"
-                    >
-                      <Plus className="w-3 h-3" />
-                      Save Current
-                    </button>
-                  </div>
-                  {savedAreas.length === 0 ? (
-                    <div className="px-3 py-3 text-[11px] text-slate-500 dark:text-slate-400">
-                      Search any village/area in Navigate or tap &ldquo;Save Current&rdquo; to pin it here for next time.
-                    </div>
-                  ) : (
-                    <div className="max-h-60 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
-                      {savedAreas.map((area) => {
-                        const isActive = area.id === activeSavedAreaId;
-                        return (
-                          <div
-                            key={area.id}
-                            className={`flex items-center justify-between gap-2 px-2.5 py-2 ${
-                              isActive
-                                ? 'bg-emerald-50/80 dark:bg-emerald-950/50'
-                                : 'hover:bg-slate-50 dark:hover:bg-slate-800/70'
-                            }`}
-                          >
-                            <button
-                              type="button"
-                              onClick={() => handleJumpToSavedArea(area)}
-                              className="flex-1 min-w-0 text-left flex items-start gap-2 cursor-pointer"
-                            >
-                              <MapPin
-                                className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
-                                  isActive
-                                    ? 'text-emerald-700 dark:text-emerald-400'
-                                    : 'text-slate-400'
-                                }`}
-                              />
-                              <div className="min-w-0">
-                                <div className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
-                                  {area.name}
-                                </div>
-                                <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                                  {area.displayName}
-                                </div>
-                              </div>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteSavedArea(area.id)}
-                              aria-label={`Remove ${area.name}`}
-                              className="p-1 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded cursor-pointer shrink-0"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </>
+                <span>AutoMapX</span>
+              </button>
+            )}
+            {isAutoRecording && mode !== 'auto' && (
+              <button
+                type="button"
+                onClick={() => setMode('auto')}
+                className="hidden sm:inline-flex px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-semibold items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                <span>Auto Live</span>
+              </button>
             )}
           </div>
 
-          {amxIsRunning && mode !== 'automapx' && (
+          <div className="flex items-center gap-1 shrink-0">
             <button
               type="button"
-              onClick={() => setMode('automapx')}
-              className="px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-950/70 text-violet-800 dark:text-violet-300 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+              onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+              className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-amber-300 border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center cursor-pointer transition-colors"
             >
-              <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  amxIsPaused ? 'bg-amber-500' : 'bg-violet-600 animate-pulse'
-                }`}
-              />
-              <span>AutoMapX {amxIsPaused ? 'Paused' : 'Live'}</span>
+              {theme === 'dark' ? <Sun className="w-3.5 h-3.5 sm:w-4 sm:h-4" /> : <Moon className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}
             </button>
-          )}
-          {isAutoRecording && mode !== 'auto' && (
-            <button
-              type="button"
-              onClick={() => setMode('auto')}
-              className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-              <span>Auto Live</span>
-            </button>
-          )}
-        </div>
-
-        <div className="flex items-center gap-1.5 shrink-0">
-          <button
-            type="button"
-            onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
-            className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-amber-300 border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center cursor-pointer transition-colors"
-          >
-            {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-          </button>
-          <PWAInstallButton />
-        </div>
-      </header>
+            <PWAInstallButton />
+          </div>
+        </header>
+      )}
 
       {/* Main Content */}
-      <main className="flex-1 min-h-0 relative flex flex-col lg:flex-row">
-        {mode === 'preview' ? (
+      <main className="flex-1 min-h-0 overflow-hidden relative flex flex-col lg:flex-row">
+        {mode === 'map' ? (
+          <div className="w-full h-full relative">
+            {cleanMapElement}
+
+            {mapCleanScreen ? (
+              <button
+                type="button"
+                onClick={() => setMapCleanScreen(false)}
+                title="Show controls"
+                className="absolute top-3 right-3 z-[460] px-2.5 py-1.5 rounded-xl bg-slate-900/55 hover:bg-slate-900/85 text-white text-[11px] font-semibold inline-flex items-center gap-1.5 backdrop-blur-sm cursor-pointer transition-opacity opacity-70 hover:opacity-100"
+              >
+                <Eye className="w-3.5 h-3.5" />
+                <span>Show UI</span>
+              </button>
+            ) : (
+              <div className="absolute top-2.5 left-1/2 -translate-x-1/2 z-[460] max-w-[calc(100%-1rem)] flex flex-wrap items-center justify-center gap-1.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-slate-200 dark:border-slate-700 rounded-xl shadow-lg px-2.5 py-1.5">
+                <span className="text-[11px] font-bold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                  Roads Only ({roads.filter((r) => r.points.length >= 2).length})
+                </span>
+
+                {vehHierarchySummary.surveyedPercent > 0 && (
+                  <div className="hidden sm:flex items-center gap-2 text-[10px] font-semibold border-l border-slate-200 dark:border-slate-700 pl-2">
+                    <span className="inline-flex items-center gap-1 text-blue-800 dark:text-blue-300">
+                      <span className="w-2.5 h-1 rounded-full bg-blue-700" />
+                      Main
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300">
+                      <span className="w-2.5 h-1 rounded-full bg-emerald-600" />
+                      Car
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-orange-700 dark:text-orange-300">
+                      <span className="w-2.5 h-1 rounded-full bg-orange-600" />
+                      No Car
+                    </span>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => handleFitAllRoadsOnly()}
+                  className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-[11px] font-semibold text-slate-800 dark:text-slate-100 inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <Maximize2 className="w-3 h-3" />
+                  <span>Fit Roads</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setMapCleanScreen(true)}
+                  title="Hide all UI, headers & GPS markers for YouTube / clean screen recording"
+                  className="px-2.5 py-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <EyeOff className="w-3 h-3" />
+                  <span>Clean Screen</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMapCleanScreen(false);
+                    setMode('navigate');
+                  }}
+                  aria-label="Close clean road map"
+                  className="p-1 rounded-lg bg-slate-100 hover:bg-red-50 dark:bg-slate-800 dark:hover:bg-red-950/60 text-slate-600 dark:text-slate-300 hover:text-red-700 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
+        ) : mode === 'vehicles' ? (
+          <div className="w-full h-full">
+            <VehiclesWorkspace
+              roads={roads}
+              waypoints={vehTourWaypoints}
+              currentIdx={vehIdx}
+              isPlaying={vehIsPlaying}
+              simSpeed={vehSpeed}
+              carOn={vehCarOn}
+              autoFollow={vehAutoFollow}
+              summary={vehHierarchySummary}
+              onTogglePlay={() => {
+                if (vehTourWaypoints.length < 2) return;
+                if (vehIsPlaying) {
+                  setVehIsPlaying(false);
+                } else {
+                  if (vehIdx >= vehTourWaypoints.length - 1) {
+                    setVehIdx(0);
+                  }
+                  const startWp =
+                    vehTourWaypoints[
+                      vehIdx >= vehTourWaypoints.length - 1 ? 0 : vehIdx
+                    ];
+                  if (startWp) {
+                    stampSegmentIfChanged(
+                      startWp.roadId,
+                      startWp.segIndex,
+                      vehCarOn ? 'car' : 'no_car'
+                    );
+                    if (vehAutoFollow) {
+                      setFocusTarget({ lat: startWp.lat, lng: startWp.lng, key: Date.now() });
+                    }
+                  }
+                  setVehIsPlaying(true);
+                }
+              }}
+              onSetCarOn={handleVehSetCarOn}
+              onSetSimSpeed={setVehSpeed}
+              onToggleAutoFollow={() => setVehAutoFollow((v) => !v)}
+              onJumpIndex={handleVehJumpIndex}
+              onJumpToRoad={handleVehJumpToRoad}
+              onPrevRoad={() => handleVehPrevNextRoad(-1)}
+              onNextRoad={() => handleVehPrevNextRoad(1)}
+              onStampWholeRoad={(roadId, access) => {
+                setRoads((prev) => stampRoadSegmentAccess(prev, roadId, 'all', access));
+              }}
+              onResetAllMarks={() => {
+                setVehIsPlaying(false);
+                setRoads((prev) =>
+                  classifyVillageRoadHierarchy(
+                    prev.map((r) => ({ ...r, segmentAccess: undefined, roadRole: 'unmarked' }))
+                  )
+                );
+              }}
+              onFitAllRoads={() => handleFitAllRoadsOnly()}
+              onOpenCleanMap={() => {
+                setVehIsPlaying(false);
+                setMapCleanScreen(false);
+                setMode('map');
+                setTimeout(() => handleFitAllRoadsOnly(), 60);
+              }}
+              mapSlot={vehiclesMapElement}
+            />
+          </div>
+        ) : mode === 'preview' ? (
           <div className="w-full h-full">
             <SavedDataView
-              roads={roads}
+              roads={editorEnabled ? editorDraftRoads : roads}
               houses={houses}
               mapSlot={previewMapElement}
+              roadEditor={previewRoadEditorUi}
               fromHouseId={previewFromHouseId}
               toHouseId={previewToHouseId}
               onSelectFromHouse={(id) => {
@@ -3624,6 +5002,12 @@ export default function App() {
                 key: Date.now(),
               })
             }
+            nearestRoadSnap={
+              amxNearestSnap
+                ? { roadName: amxNearestSnap.roadName, distMeters: amxNearestSnap.distMeters }
+                : null
+            }
+            onSnapToNearestRoad={handleAmxSnapToRoad}
             mapSlot={autoMapXMapElement}
           />
         ) : mode === 'add' ? (
@@ -3662,6 +5046,12 @@ export default function App() {
             onSaveWalkedRoad={handleSaveWalkedRoad}
             nextSuggestedHouse={nextSuggestedHouse}
             onLocateMe={handleLocateMe}
+            nearestRoadSnap={
+              walkNearestSnap
+                ? { roadName: walkNearestSnap.roadName, distMeters: walkNearestSnap.distMeters }
+                : null
+            }
+            onSnapToNearestRoad={handleSnapWalkToRoad}
             mapSlot={mapElement}
           />
         ) : (
@@ -3933,17 +5323,18 @@ export default function App() {
         )}
       </main>
 
-      {/* Persistent Thumb-Zone Bottom Navigation Bar with AutoMapX */}
+      {/* Persistent Lifted Thumb-Zone Bottom Navigation Bar (hidden only in pure Clean Screen recording mode) */}
+      {!isPureRecordingScreen && (
       <nav
         aria-label="Primary Workspace Navigation"
-        className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 h-14 px-1 sm:px-6 grid grid-cols-5 items-center z-40"
+        className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-1 sm:px-6 pt-1.5 pb-[max(1.1rem,env(safe-area-inset-bottom))] sm:py-1.5 grid grid-cols-5 items-center z-[530] shadow-[0_-4px_16px_rgba(15,23,42,0.08)] dark:shadow-[0_-4px_16px_rgba(0,0,0,0.35)]"
       >
         <button
           type="button"
           onClick={() => setMode('navigate')}
-          className={`h-full min-h-[44px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
+          className={`min-h-[48px] sm:min-h-[44px] py-1 rounded-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
             mode === 'navigate'
-              ? 'text-sky-700 dark:text-sky-400'
+              ? 'text-sky-700 dark:text-sky-400 bg-sky-50/70 dark:bg-sky-950/40'
               : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
           }`}
         >
@@ -3959,9 +5350,9 @@ export default function App() {
             setMode('add');
             setTargetHouse(null);
           }}
-          className={`h-full min-h-[44px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
+          className={`min-h-[48px] sm:min-h-[44px] py-1 rounded-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
             mode === 'add'
-              ? 'text-emerald-700 dark:text-emerald-400'
+              ? 'text-emerald-700 dark:text-emerald-400 bg-emerald-50/70 dark:bg-emerald-950/40'
               : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
           }`}
         >
@@ -3987,9 +5378,9 @@ export default function App() {
               setAmxCursor(cur);
             }
           }}
-          className={`relative h-full min-h-[44px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
+          className={`relative min-h-[48px] sm:min-h-[44px] py-1 rounded-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
             mode === 'automapx'
-              ? 'text-violet-700 dark:text-violet-400'
+              ? 'text-violet-700 dark:text-violet-400 bg-violet-50/70 dark:bg-violet-950/40'
               : 'text-slate-600 dark:text-slate-300 hover:text-violet-700 dark:hover:text-violet-300'
           }`}
         >
@@ -4020,9 +5411,9 @@ export default function App() {
               }
             }
           }}
-          className={`relative h-full min-h-[44px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
+          className={`relative min-h-[48px] sm:min-h-[44px] py-1 rounded-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
             mode === 'auto'
-              ? 'text-sky-700 dark:text-sky-400'
+              ? 'text-sky-700 dark:text-sky-400 bg-sky-50/70 dark:bg-sky-950/40'
               : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
           }`}
         >
@@ -4042,14 +5433,14 @@ export default function App() {
           onClick={() => {
             setMode('preview');
             setTimeout(() => {
-              if (!previewFromHouse && !previewToHouse) {
+              if (!editorEnabled && !previewFromHouse && !previewToHouse) {
                 handleFitAllSaved();
               }
             }, 60);
           }}
-          className={`h-full min-h-[44px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
+          className={`min-h-[48px] sm:min-h-[44px] py-1 rounded-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors ${
             mode === 'preview'
-              ? 'text-slate-900 dark:text-white'
+              ? 'text-slate-900 dark:text-white bg-slate-100/80 dark:bg-slate-800/80'
               : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
           }`}
         >
@@ -4059,6 +5450,7 @@ export default function App() {
           </span>
         </button>
       </nav>
+      )}
     </div>
   );
 }

@@ -18,6 +18,7 @@ import {
   Gauge,
   History,
   Home,
+  Link2,
   List,
   LocateFixed,
   MapPin,
@@ -138,15 +139,17 @@ interface AutoMapXWorkspaceProps {
   ) => void;
   onRemoveSavedHouse: (houseId: string) => void;
   onFocusHouse: (house: VillageHouse) => void;
+  nearestRoadSnap?: { roadName: string; distMeters: number } | null;
+  onSnapToNearestRoad?: () => void;
   mapSlot: ReactNode;
 }
 
 const SPEED_PRESETS: { label: string; mps: number }[] = [
+  { label: 'Crawl', mps: 0.3 },
   { label: 'Slow', mps: 0.8 },
   { label: 'Walk', mps: 1.5 },
   { label: 'Jog', mps: 3.0 },
   { label: 'Cycle', mps: 6.0 },
-  { label: 'Bike', mps: 10.0 },
 ];
 
 function cardinalDirection(deg: number): string {
@@ -214,6 +217,8 @@ export default function AutoMapXWorkspace({
   onAddHouseOnSavedRoad,
   onRemoveSavedHouse,
   onFocusHouse,
+  nearestRoadSnap = null,
+  onSnapToNearestRoad,
   mapSlot,
 }: AutoMapXWorkspaceProps) {
   const [timelineOpen, setTimelineOpen] = useState(false);
@@ -652,6 +657,18 @@ export default function AutoMapXWorkspace({
                   >
                     <Crosshair className="w-3.5 h-3.5" />
                   </button>
+
+                  {nearestRoadSnap && onSnapToNearestRoad && (
+                    <button
+                      type="button"
+                      onClick={onSnapToNearestRoad}
+                      title={`Snap & touch ${nearestRoadSnap.roadName} (${Math.round(nearestRoadSnap.distMeters)}m away) between its points`}
+                      className="px-2 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 shadow-xs"
+                    >
+                      <Link2 className="w-3.5 h-3.5" />
+                      <span className="max-w-[96px] truncate">Touch {nearestRoadSnap.roadName}</span>
+                    </button>
+                  )}
                 </div>
 
                 {/* Primary Build Lifecycle Controls */}
@@ -1099,9 +1116,9 @@ export default function AutoMapXWorkspace({
 
             <input
               type="range"
-              min={0.3}
+              min={0.15}
               max={18}
-              step={0.1}
+              step={0.05}
               value={speedMps}
               onChange={(e) => onSetSpeedMps(Number(e.target.value))}
               aria-label="Virtual speed in meters per second"
@@ -1111,15 +1128,18 @@ export default function AutoMapXWorkspace({
             <div className="flex items-center gap-0.5 shrink-0">
               <button
                 type="button"
-                onClick={() => onSetSpeedMps(Math.max(0.3, Number((speedMps - 0.5).toFixed(1))))}
-                title="Decrease speed by 0.5 m/s"
+                onClick={() => {
+                  const step = speedMps <= 1.0 ? 0.1 : 0.5;
+                  onSetSpeedMps(Math.max(0.15, Number((speedMps - step).toFixed(2))));
+                }}
+                title="Decrease speed"
                 aria-label="Decrease speed"
                 className="w-7 h-7 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center cursor-pointer"
               >
                 <Minus className="w-3 h-3" />
               </button>
               <span className="px-1 text-[11px] font-mono tabular-nums font-bold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                {speedMps.toFixed(1)}m/s
+                {speedMps.toFixed(2).replace(/\.00$/, '')}m/s
                 <span className="hidden xl:inline text-slate-500 dark:text-slate-400 font-normal">
                   {' '}
                   ({(speedMps * 3.6).toFixed(1)} km/h)
@@ -1127,8 +1147,11 @@ export default function AutoMapXWorkspace({
               </span>
               <button
                 type="button"
-                onClick={() => onSetSpeedMps(Math.min(18, Number((speedMps + 0.5).toFixed(1))))}
-                title="Increase speed by 0.5 m/s"
+                onClick={() => {
+                  const step = speedMps < 1.0 ? 0.1 : 0.5;
+                  onSetSpeedMps(Math.min(18, Number((speedMps + step).toFixed(2))));
+                }}
+                title="Increase speed"
                 aria-label="Increase speed"
                 className="w-7 h-7 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center cursor-pointer"
               >

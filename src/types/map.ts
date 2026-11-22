@@ -54,6 +54,10 @@ export interface VillageHouse {
   createdAt: string;
 }
 
+export type VehicleSegmentAccess = 'car' | 'no_car' | 'unmarked';
+
+export type RoadHierarchyRole = 'main' | 'car_street' | 'narrow_lane' | 'unmarked';
+
 export interface VillageRoad {
   id: string;
   name: string;
@@ -64,6 +68,8 @@ export interface VillageRoad {
   distanceMeters: number;
   durationSeconds: number;
   captureMode: CaptureMode;
+  segmentAccess?: VehicleSegmentAccess[];
+  roadRole?: RoadHierarchyRole;
   createdAt: string;
 }
 

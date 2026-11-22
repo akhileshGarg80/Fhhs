@@ -3,8 +3,10 @@ import type {
   JunctionDirection,
   LatLngPoint,
   NavigationInstruction,
+  RoadHierarchyRole,
   RoadJunction,
   TurnDirection,
+  VehicleSegmentAccess,
   VillageHouse,
   VillageRoad,
   VillageRouteResult,
@@ -1296,14 +1298,14 @@ export function autoLinkNewRoadsToNetwork(
   updatedExistingRoads: VillageRoad[];
   linkedSummaries: string[];
 } {
-  const updatedExisting = existingRoads.map((r) => ({
+  const updatedExisting: VillageRoad[] = existingRoads.map((r) => ({
     ...r,
     junctions: r.junctions?.map((j) => ({
       ...j,
-      branches: j.branches?.map((b) => ({ ...b })),
+      ...(j.branches ? { branches: j.branches.map((b) => ({ ...b })) } : {}),
     })),
   }));
-  const linkedNew = newRoads.map((r) => ({
+  const linkedNew: VillageRoad[] = newRoads.map((r) => ({
     ...r,
     points: r.points.map((p) => ({ ...p })),
   }));
@@ -1415,56 +1417,473 @@ export function autoLinkNewRoadsToNetwork(
       );
     }
 
-    // 2. If not linked to an explicit pending branch, auto-snap start/end to any nearby saved road segment
-    if (!linkedToJunction && updatedExisting.length > 0) {
-      let bestSnap: {
-        pt: { lat: number; lng: number };
-        dist: number;
-        attachEnd: 'start' | 'end';
-        parentName: string;
-      } | null = null;
+    // 2. Smart Overlap Trimming + Dual-End Mid-Segment Touch Linking + Crossing Splits
+    if (updatedExisting.length > 0) {
+      const OVERLAP_TRIM_M = 6.5;
+      const ENDPOINT_SNAP_M = 20;
 
-      for (const ex of updatedExisting) {
-        for (let si = 0; si < ex.points.length - 1; si++) {
-          const pStart = projectPointOnSegment(road.points[0], ex.points[si], ex.points[si + 1]);
-          if (pStart.distMeters <= 18 && (!bestSnap || pStart.distMeters < bestSnap.dist)) {
-            bestSnap = {
-              pt: pStart.point,
-              dist: pStart.distMeters,
-              attachEnd: 'start',
-              parentName: ex.name,
-            };
+      // 2a. Trim redundant overlapping tail points where new road was walked on top of an existing road
+      if (!linkedToJunction && road.points.length >= 3) {
+        let trimStartCount = 0;
+        for (let i = 0; i < road.points.length - 2; i++) {
+          const hit = findNearestRoadSnap(road.points[i], updatedExisting, OVERLAP_TRIM_M);
+          const nextHit = findNearestRoadSnap(road.points[i + 1], updatedExisting, OVERLAP_TRIM_M);
+          if (hit && nextHit) {
+            trimStartCount++;
+          } else {
+            break;
           }
-          const last = road.points[road.points.length - 1];
-          const pEnd = projectPointOnSegment(last, ex.points[si], ex.points[si + 1]);
-          if (pEnd.distMeters <= 18 && (!bestSnap || pEnd.distMeters < bestSnap.dist)) {
-            bestSnap = {
-              pt: pEnd.point,
-              dist: pEnd.distMeters,
-              attachEnd: 'end',
-              parentName: ex.name,
-            };
+        }
+        if (trimStartCount > 0) {
+          road.points = road.points.slice(trimStartCount);
+        }
+      }
+
+      if (road.points.length >= 3) {
+        let trimEndCount = 0;
+        for (let i = road.points.length - 1; i >= 2; i--) {
+          const hit = findNearestRoadSnap(road.points[i], updatedExisting, OVERLAP_TRIM_M);
+          const prevHit = findNearestRoadSnap(road.points[i - 1], updatedExisting, OVERLAP_TRIM_M);
+          if (hit && prevHit) {
+            trimEndCount++;
+          } else {
+            break;
+          }
+        }
+        if (trimEndCount > 0) {
+          road.points = road.points.slice(0, road.points.length - trimEndCount);
+        }
+      }
+
+      // 2b. Attach Start endpoint to nearest existing road (splitting segment A–B in BOTH roads!)
+      if (!linkedToJunction) {
+        const startSnap = findNearestRoadSnap(road.points[0], updatedExisting, ENDPOINT_SNAP_M);
+        if (startSnap) {
+          const exIdx = updatedExisting.findIndex((r) => r.id === startSnap.roadId);
+          if (exIdx >= 0) {
+            const { road: splitEx, insertedPoint } = insertTouchPointIntoRoad(
+              updatedExisting[exIdx],
+              startSnap.segIndex,
+              startSnap.point
+            );
+            updatedExisting[exIdx] = splitEx;
+            if (haversineMeters(road.points[0], insertedPoint) > 0.6) {
+              road.points.unshift({
+                lat: insertedPoint.lat,
+                lng: insertedPoint.lng,
+                accuracy: 1.5,
+              });
+            } else {
+              road.points[0] = {
+                ...road.points[0],
+                lat: insertedPoint.lat,
+                lng: insertedPoint.lng,
+              };
+            }
+            linkedSummaries.push(`Connected to ${splitEx.name}`);
           }
         }
       }
 
-      if (bestSnap && bestSnap.dist > 0.6) {
-        if (bestSnap.attachEnd === 'start') {
-          road.points.unshift({ lat: bestSnap.pt.lat, lng: bestSnap.pt.lng, accuracy: 1.5 });
-        } else {
-          road.points.push({ lat: bestSnap.pt.lat, lng: bestSnap.pt.lng, accuracy: 1.5 });
+      // 2c. Attach End endpoint to nearest existing road (splitting segment A–B in BOTH roads!)
+      const lastPt = road.points[road.points.length - 1];
+      const endSnap = findNearestRoadSnap(lastPt, updatedExisting, ENDPOINT_SNAP_M);
+      if (endSnap) {
+        const distinctFromStart = haversineMeters(endSnap.point, road.points[0]) > 4.5;
+        if (distinctFromStart) {
+          const exIdx = updatedExisting.findIndex((r) => r.id === endSnap.roadId);
+          if (exIdx >= 0) {
+            const { road: splitEx, insertedPoint } = insertTouchPointIntoRoad(
+              updatedExisting[exIdx],
+              endSnap.segIndex,
+              endSnap.point
+            );
+            updatedExisting[exIdx] = splitEx;
+            if (haversineMeters(lastPt, insertedPoint) > 0.6) {
+              road.points.push({
+                lat: insertedPoint.lat,
+                lng: insertedPoint.lng,
+                accuracy: 1.5,
+              });
+            } else {
+              road.points[road.points.length - 1] = {
+                ...lastPt,
+                lat: insertedPoint.lat,
+                lng: insertedPoint.lng,
+              };
+            }
+            if (linkedSummaries.length === 0) {
+              linkedSummaries.push(`Connected to ${splitEx.name}`);
+            }
+          }
         }
-        road.distanceMeters = computePathDistance(road.points);
-        linkedSummaries.push(`Connected to ${bestSnap.parentName}`);
+      }
+
+      // 2d. Split both roads wherever any segment of the new road crosses an existing road
+      for (let ei = 0; ei < updatedExisting.length; ei++) {
+        const ex = updatedExisting[ei];
+        if (ex.points.length < 2 || road.points.length < 2) continue;
+
+        const hits: {
+          newSegIdx: number;
+          t: number;
+          exSegIdx: number;
+          u: number;
+          point: { lat: number; lng: number };
+        }[] = [];
+
+        for (let si = 0; si < road.points.length - 1; si++) {
+          for (let sj = 0; sj < ex.points.length - 1; sj++) {
+            const hit = segmentIntersection(
+              road.points[si],
+              road.points[si + 1],
+              ex.points[sj],
+              ex.points[sj + 1]
+            );
+            if (hit) {
+              hits.push({ newSegIdx: si, t: hit.t, exSegIdx: sj, u: hit.u, point: hit.point });
+            }
+          }
+        }
+
+        if (hits.length > 0) {
+          // Apply splits sorted backwards so earlier indices stay valid
+          const newBySeg = hits.slice().sort((a, b) => b.newSegIdx - a.newSegIdx || b.t - a.t);
+          for (const h of newBySeg) {
+            const { road: splitNew } = insertTouchPointIntoRoad(road, h.newSegIdx, h.point);
+            road.points = splitNew.points;
+          }
+
+          let updatedEx = ex;
+          const exBySeg = hits.slice().sort((a, b) => b.exSegIdx - a.exSegIdx || b.u - a.u);
+          for (const h of exBySeg) {
+            updatedEx = insertTouchPointIntoRoad(updatedEx, h.exSegIdx, h.point).road;
+          }
+          updatedExisting[ei] = updatedEx;
+          if (!linkedSummaries.includes(`Crosses ${ex.name}`)) {
+            linkedSummaries.push(`Crosses ${ex.name}`);
+          }
+        }
+      }
+
+      road.points = dedupSequentialPoints(road.points, 0.35);
+      road.distanceMeters = computePathDistance(road.points);
+    }
+
+    // Also include this newly linked road so subsequent branches in the same batch link cleanly
+    updatedExisting.push({
+      ...road,
+      points: road.points.map((p) => ({ ...p })),
+      junctions: road.junctions?.map((j) => ({
+        ...j,
+        ...(j.branches ? { branches: j.branches.map((b) => ({ ...b })) } : {}),
+      })),
+    });
+  }
+
+  // Keep existing roads array ordering (exclude the newly appended items we pushed inside loop)
+  const finalExisting = updatedExisting.slice(0, existingRoads.length);
+
+  return {
+    linkedNewRoads: linkedNew,
+    updatedExistingRoads: finalExisting,
+    linkedSummaries,
+  };
+}
+
+export interface RoadSnapHit {
+  roadId: string;
+  roadName: string;
+  segIndex: number;
+  t: number;
+  point: { lat: number; lng: number };
+  distMeters: number;
+}
+
+function dedupSequentialPoints(points: LatLngPoint[], minStepMeters = 0.35): LatLngPoint[] {
+  if (points.length <= 2) return points;
+  const out: LatLngPoint[] = [points[0]];
+  for (let i = 1; i < points.length; i++) {
+    const isLast = i === points.length - 1;
+    if (haversineMeters(out[out.length - 1], points[i]) >= minStepMeters || isLast) {
+      out.push(points[i]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Finds the closest point on ANY saved road segment (either an existing vertex or between points A and B).
+ */
+export function findNearestRoadSnap(
+  pt: { lat: number; lng: number },
+  roads: VillageRoad[],
+  maxDistMeters = 20,
+  excludeRoadIds?: Set<string>
+): RoadSnapHit | null {
+  let best: RoadSnapHit | null = null;
+  for (const r of roads) {
+    if (excludeRoadIds?.has(r.id) || r.points.length < 2) continue;
+    for (let si = 0; si < r.points.length - 1; si++) {
+      const a = r.points[si];
+      const b = r.points[si + 1];
+      const proj = projectPointOnSegment(pt, a, b);
+      if (proj.distMeters <= maxDistMeters && (!best || proj.distMeters < best.distMeters)) {
+        const dA = haversineMeters(proj.point, a);
+        const dB = haversineMeters(proj.point, b);
+        const snappedPt =
+          dA <= 1.2
+            ? { lat: a.lat, lng: a.lng }
+            : dB <= 1.2
+            ? { lat: b.lat, lng: b.lng }
+            : proj.point;
+        best = {
+          roadId: r.id,
+          roadName: r.name,
+          segIndex: si,
+          t: dA <= 1.2 ? 0 : dB <= 1.2 ? 1 : proj.t,
+          point: snappedPt,
+          distMeters: proj.distMeters,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Inserts a shared touch vertex right onto segment [segIndex, segIndex+1] between points A and B
+ * (unless an endpoint vertex is already within 1.2m), returning updated road + shared vertex coord.
+ */
+export function insertTouchPointIntoRoad(
+  road: VillageRoad,
+  segIndex: number,
+  pt: { lat: number; lng: number }
+): { road: VillageRoad; insertedPoint: { lat: number; lng: number } } {
+  if (segIndex < 0 || segIndex >= road.points.length - 1) {
+    return { road, insertedPoint: pt };
+  }
+  const a = road.points[segIndex];
+  const b = road.points[segIndex + 1];
+  if (haversineMeters(a, pt) <= 1.2) {
+    return { road, insertedPoint: { lat: a.lat, lng: a.lng } };
+  }
+  if (haversineMeters(b, pt) <= 1.2) {
+    return { road, insertedPoint: { lat: b.lat, lng: b.lng } };
+  }
+  const nextPoints = road.points.slice();
+  nextPoints.splice(segIndex + 1, 0, {
+    lat: pt.lat,
+    lng: pt.lng,
+    accuracy: 1.5,
+    timestamp: Date.now(),
+  });
+  return {
+    road: {
+      ...road,
+      points: nextPoints,
+      distanceMeters: computePathDistance(nextPoints),
+    },
+    insertedPoint: { lat: pt.lat, lng: pt.lng },
+  };
+}
+
+/**
+ * Erases points (and breaks segments crossing through) within radiusMeters of `center`.
+ * Returns 0, 1, or 2+ cleaned VillageRoad chunks cleanly preserving original metadata.
+ */
+export function eraseRoadPointsNear(
+  road: VillageRoad,
+  center: { lat: number; lng: number },
+  radiusMeters: number
+): VillageRoad[] {
+  if (road.points.length < 2) return [];
+
+  const runs: LatLngPoint[][] = [];
+  let current: LatLngPoint[] = [];
+
+  for (let i = 0; i < road.points.length; i++) {
+    const pt = road.points[i];
+    const inside = haversineMeters(pt, center) <= radiusMeters;
+
+    if (inside) {
+      if (current.length >= 2) {
+        runs.push(current);
+      }
+      current = [];
+      continue;
+    }
+
+    if (current.length > 0) {
+      const prev = current[current.length - 1];
+      const segProj = projectPointOnSegment(center, prev, pt);
+      if (segProj.distMeters <= radiusMeters && segProj.t > 0.05 && segProj.t < 0.95) {
+        if (current.length >= 2) {
+          runs.push(current);
+        }
+        current = [pt];
+        continue;
+      }
+    }
+
+    current.push(pt);
+  }
+
+  if (current.length >= 2) {
+    runs.push(current);
+  }
+
+  if (runs.length === 0) return [];
+
+  const ts = Date.now();
+  return runs.map((pts, idx) => {
+    const keptJunctions = road.junctions?.filter((j) =>
+      pts.some((p) => haversineMeters(p, j) <= 22)
+    );
+    return {
+      ...road,
+      id: idx === 0 ? road.id : `${road.id}-part-${ts}-${idx}`,
+      name: runs.length === 1 ? road.name : `${road.name} (${idx + 1})`,
+      points: pts,
+      junctions: keptJunctions && keptJunctions.length > 0 ? keptJunctions : undefined,
+      distanceMeters: computePathDistance(pts),
+    };
+  });
+}
+
+/**
+ * Applies a hand-drawn line (from Preview Road Editor) onto the working draft road list:
+ * - If drawn from an open start/end of `activeRoadId`, extends that road cleanly and splits/touches any road it ends on.
+ * - Otherwise adds a connected line snapped at both start & end (including mid-segments A–B) and splits crossed/touched roads.
+ */
+export function applyHandDrawnSegmentToRoads(
+  drawnPoints: LatLngPoint[],
+  roads: VillageRoad[],
+  options: {
+    activeRoadId: string | null;
+    snapEnabled?: boolean;
+    snapRadiusMeters?: number;
+    defaultVillageName: string;
+  }
+): { nextRoads: VillageRoad[]; selectedRoadId: string | null } {
+  const clean = dedupSequentialPoints(drawnPoints, 0.8);
+  if (clean.length < 2) {
+    return { nextRoads: roads, selectedRoadId: options.activeRoadId };
+  }
+
+  const snapOn = options.snapEnabled !== false;
+  const snapR = snapOn ? options.snapRadiusMeters ?? 16 : 0;
+  let working: VillageRoad[] = roads.map((r) => ({
+    ...r,
+    points: r.points.map((p) => ({ ...p })),
+    junctions: r.junctions?.map((j) => ({
+      ...j,
+      ...(j.branches ? { branches: j.branches.map((b) => ({ ...b })) } : {}),
+    })),
+  }));
+
+  // 1. Check if user started right from the start/end tip of activeRoadId to extend it seamlessly
+  if (options.activeRoadId) {
+    const targetIdx = working.findIndex((r) => r.id === options.activeRoadId);
+    if (targetIdx >= 0 && working[targetIdx].points.length >= 2) {
+      const activeRoad = working[targetIdx];
+      const firstPt = activeRoad.points[0];
+      const lastPt = activeRoad.points[activeRoad.points.length - 1];
+      const dToEnd = haversineMeters(clean[0], lastPt);
+      const dToStart = haversineMeters(clean[0], firstPt);
+      const extendRadius = Math.max(12, snapR);
+
+      if (dToEnd <= extendRadius && dToEnd <= dToStart) {
+        const tail = clean.slice(1);
+        const endSnap =
+          snapOn && tail.length > 0
+            ? findNearestRoadSnap(tail[tail.length - 1], working, snapR, new Set([activeRoad.id]))
+            : null;
+        if (endSnap) {
+          const exIdx = working.findIndex((r) => r.id === endSnap.roadId);
+          if (exIdx >= 0) {
+            const { road: splitEx, insertedPoint } = insertTouchPointIntoRoad(
+              working[exIdx],
+              endSnap.segIndex,
+              endSnap.point
+            );
+            working[exIdx] = splitEx;
+            tail[tail.length - 1] = {
+              lat: insertedPoint.lat,
+              lng: insertedPoint.lng,
+              accuracy: 1.5,
+              timestamp: Date.now(),
+            };
+          }
+        }
+        const mergedPts = dedupSequentialPoints([...activeRoad.points, ...tail], 0.4);
+        working[targetIdx] = {
+          ...activeRoad,
+          points: mergedPts,
+          distanceMeters: computePathDistance(mergedPts),
+        };
+        return { nextRoads: working, selectedRoadId: activeRoad.id };
+      }
+
+      if (dToStart <= extendRadius) {
+        const rev = clean.slice(1).reverse();
+        const startSnap =
+          snapOn && rev.length > 0
+            ? findNearestRoadSnap(rev[0], working, snapR, new Set([activeRoad.id]))
+            : null;
+        if (startSnap) {
+          const exIdx = working.findIndex((r) => r.id === startSnap.roadId);
+          if (exIdx >= 0) {
+            const { road: splitEx, insertedPoint } = insertTouchPointIntoRoad(
+              working[exIdx],
+              startSnap.segIndex,
+              startSnap.point
+            );
+            working[exIdx] = splitEx;
+            rev[0] = {
+              lat: insertedPoint.lat,
+              lng: insertedPoint.lng,
+              accuracy: 1.5,
+              timestamp: Date.now(),
+            };
+          }
+        }
+        const mergedPts = dedupSequentialPoints([...rev, ...activeRoad.points], 0.4);
+        working[targetIdx] = {
+          ...activeRoad,
+          points: mergedPts,
+          distanceMeters: computePathDistance(mergedPts),
+        };
+        return { nextRoads: working, selectedRoadId: activeRoad.id };
       }
     }
   }
 
-  return {
-    linkedNewRoads: linkedNew,
-    updatedExistingRoads: updatedExisting,
-    linkedSummaries,
+  // 2. Otherwise create a new drawn connector/lane and link + split touched roads cleanly
+  const newRoad: VillageRoad = {
+    id: `road-edit-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+    name: `Connected Lane (${Math.round(computePathDistance(clean))}m)`,
+    villageName: working[0]?.villageName ?? options.defaultVillageName,
+    surface: 'concrete',
+    points: clean,
+    distanceMeters: computePathDistance(clean),
+    durationSeconds: 0,
+    captureMode: 'manual_trace',
+    createdAt: new Date().toISOString(),
   };
+
+  if (snapOn) {
+    const { linkedNewRoads, updatedExistingRoads } = autoLinkNewRoadsToNetwork(
+      [newRoad],
+      working,
+      null
+    );
+    working = [...linkedNewRoads, ...updatedExistingRoads];
+    return { nextRoads: working, selectedRoadId: linkedNewRoads[0]?.id ?? null };
+  }
+
+  working = [newRoad, ...working];
+  return { nextRoads: working, selectedRoadId: newRoad.id };
 }
 
 export interface SimWaypoint {
@@ -1525,4 +1944,611 @@ export function buildSimulatorWaypoints(
 
   return result;
 }
+
+export interface AheadRoadTarget {
+  roadId: string;
+  roadName: string;
+  isEndpoint: boolean;
+  endpointEnd?: 'start' | 'end';
+  segIndex: number;
+  lat: number;
+  lng: number;
+  distMeters: number;
+  bearingDeg: number;
+  turnDeltaDeg: number;
+}
+
+/**
+ * Looks ahead of the moving Editor AutoMap cursor to detect an upcoming road part or cut endpoint
+ * before reaching it, so the user sees distance + required steering angle and can connect seamlessly.
+ */
+export function findAheadRoadTarget(
+  cursor: { lat: number; lng: number },
+  cursorHeadingDeg: number,
+  roads: VillageRoad[],
+  options: {
+    anchorRoadId?: string | null;
+    anchorOrigin?: { lat: number; lng: number } | null;
+    walkedMeters?: number;
+    maxRangeMeters?: number;
+  } = {}
+): AheadRoadTarget | null {
+  const maxRange = options.maxRangeMeters ?? 95;
+  const walked = options.walkedMeters ?? 0;
+
+  let bestEndpoint: (AheadRoadTarget & { score: number }) | null = null;
+  let bestSegment: (AheadRoadTarget & { score: number }) | null = null;
+
+  for (const r of roads) {
+    if (r.points.length < 2) continue;
+
+    // 1. Check open road endpoints (highest priority when reconnecting cut gaps)
+    const endpoints: { end: 'start' | 'end'; pt: LatLngPoint; segIndex: number }[] = [
+      { end: 'start', pt: r.points[0], segIndex: 0 },
+      { end: 'end', pt: r.points[r.points.length - 1], segIndex: r.points.length - 2 },
+    ];
+
+    for (const ep of endpoints) {
+      if (
+        options.anchorOrigin &&
+        walked < 16 &&
+        haversineMeters(ep.pt, options.anchorOrigin) < 10
+      ) {
+        continue;
+      }
+      if (r.id === options.anchorRoadId && walked < 18) continue;
+
+      const dist = haversineMeters(cursor, ep.pt);
+      if (dist > maxRange || dist < 0.2) continue;
+
+      const brg = calculateBearing(cursor, ep.pt);
+      const turnDeltaDeg = ((brg - cursorHeadingDeg + 540) % 360) - 180;
+      const absAngle = Math.abs(turnDeltaDeg);
+      if (dist > 10 && absAngle > 115) continue;
+
+      const score = dist + absAngle * 0.22;
+      if (!bestEndpoint || score < bestEndpoint.score) {
+        bestEndpoint = {
+          roadId: r.id,
+          roadName: r.name,
+          isEndpoint: true,
+          endpointEnd: ep.end,
+          segIndex: ep.segIndex,
+          lat: ep.pt.lat,
+          lng: ep.pt.lng,
+          distMeters: dist,
+          bearingDeg: brg,
+          turnDeltaDeg,
+          score,
+        };
+      }
+    }
+
+    // 2. Check mid-segments along all other roads (or far segments of same road)
+    if (r.id === options.anchorRoadId && walked < 22) continue;
+    for (let si = 0; si < r.points.length - 1; si++) {
+      const a = r.points[si];
+      const b = r.points[si + 1];
+      const proj = projectPointOnSegment(cursor, a, b);
+      if (proj.distMeters > maxRange) continue;
+      if (
+        options.anchorOrigin &&
+        walked < 16 &&
+        haversineMeters(proj.point, options.anchorOrigin) < 12
+      ) {
+        continue;
+      }
+
+      const brg =
+        proj.distMeters >= 0.4 ? calculateBearing(cursor, proj.point) : cursorHeadingDeg;
+      const turnDeltaDeg = ((brg - cursorHeadingDeg + 540) % 360) - 180;
+      const absAngle = Math.abs(turnDeltaDeg);
+      if (proj.distMeters > 10 && absAngle > 105) continue;
+
+      const score = proj.distMeters + absAngle * 0.25;
+      if (!bestSegment || score < bestSegment.score) {
+        bestSegment = {
+          roadId: r.id,
+          roadName: r.name,
+          isEndpoint: false,
+          segIndex: si,
+          lat: proj.point.lat,
+          lng: proj.point.lng,
+          distMeters: proj.distMeters,
+          bearingDeg: brg,
+          turnDeltaDeg,
+          score,
+        };
+      }
+    }
+  }
+
+  if (bestEndpoint && (!bestSegment || bestEndpoint.distMeters <= bestSegment.distMeters + 15)) {
+    const { score: _s, ...hit } = bestEndpoint;
+    return hit;
+  }
+  if (bestSegment) {
+    const { score: _s, ...hit } = bestSegment;
+    return hit;
+  }
+  return null;
+}
+
+/**
+ * Stitches an Editor AutoMap path starting from an anchored road endpoint onto:
+ * - another cut/open road endpoint (merging the two parts seamlessly into one road), or
+ * - a mid-segment touch point on any road (inserting a shared A–P–B vertex in BOTH roads), or
+ * - extends the anchored road freely and splits any crossed road intersections.
+ */
+export function commitEditorAutoMapJoin(
+  roads: VillageRoad[],
+  anchor: { roadId: string; end: 'start' | 'end' },
+  pathPoints: LatLngPoint[],
+  options: {
+    aheadTarget?: AheadRoadTarget | null;
+    snapRadiusMeters?: number;
+  } = {}
+): { nextRoads: VillageRoad[]; selectedRoadId: string | null } {
+  const clean = dedupSequentialPoints(pathPoints, 0.4);
+  if (clean.length < 2) {
+    return { nextRoads: roads, selectedRoadId: anchor.roadId };
+  }
+
+  const working: VillageRoad[] = roads.map((r) => ({
+    ...r,
+    points: r.points.map((p) => ({ ...p })),
+    junctions: r.junctions?.map((j) => ({
+      ...j,
+      ...(j.branches ? { branches: j.branches.map((b) => ({ ...b })) } : {}),
+    })),
+  }));
+
+  const anchorIdx = working.findIndex((r) => r.id === anchor.roadId);
+  if (anchorIdx < 0 || working[anchorIdx].points.length < 2) {
+    return { nextRoads: roads, selectedRoadId: anchor.roadId };
+  }
+
+  const snapRadius = options.snapRadiusMeters ?? 24;
+  const anchorRoad = working[anchorIdx];
+  const extTail = clean.slice(1).map((p) => ({
+    lat: p.lat,
+    lng: p.lng,
+    accuracy: p.accuracy ?? 1.5,
+    timestamp: p.timestamp ?? Date.now(),
+  }));
+  if (extTail.length === 0) {
+    return { nextRoads: roads, selectedRoadId: anchor.roadId };
+  }
+
+  const walkedMeters = computePathDistance(clean);
+  const tip = extTail[extTail.length - 1];
+
+  // Determine snap target on another road (or opposite end of anchorRoad if long enough loop)
+  const exclude = walkedMeters < 20 ? new Set([anchorRoad.id]) : undefined;
+  let targetHit:
+    | {
+        roadId: string;
+        segIndex: number;
+        point: { lat: number; lng: number };
+        endpointEnd?: 'start' | 'end';
+      }
+    | null = null;
+
+  if (
+    options.aheadTarget &&
+    options.aheadTarget.distMeters <= snapRadius &&
+    (options.aheadTarget.roadId !== anchorRoad.id || walkedMeters >= 20)
+  ) {
+    targetHit = {
+      roadId: options.aheadTarget.roadId,
+      segIndex: options.aheadTarget.segIndex,
+      point: { lat: options.aheadTarget.lat, lng: options.aheadTarget.lng },
+      endpointEnd: options.aheadTarget.endpointEnd,
+    };
+  } else {
+    const snap = findNearestRoadSnap(tip, working, snapRadius, exclude);
+    if (snap) {
+      const tr = working.find((r) => r.id === snap.roadId);
+      let endpointEnd: 'start' | 'end' | undefined;
+      if (tr && tr.points.length >= 2) {
+        const dStart = haversineMeters(snap.point, tr.points[0]);
+        const dEnd = haversineMeters(snap.point, tr.points[tr.points.length - 1]);
+        if (dStart <= 6 && dStart <= dEnd) endpointEnd = 'start';
+        else if (dEnd <= 6) endpointEnd = 'end';
+      }
+      targetHit = {
+        roadId: snap.roadId,
+        segIndex: snap.segIndex,
+        point: snap.point,
+        endpointEnd,
+      };
+    }
+  }
+
+  let resultRoadId = anchorRoad.id;
+
+  if (targetHit && targetHit.roadId !== anchorRoad.id && targetHit.endpointEnd) {
+    // Merge both open road pieces seamlessly into one continuous road!
+    const targetIdx = working.findIndex((r) => r.id === targetHit!.roadId);
+    if (targetIdx >= 0) {
+      const targetRoad = working[targetIdx];
+      const anchorSeq =
+        anchor.end === 'end' ? anchorRoad.points : anchorRoad.points.slice().reverse();
+      const targetSeq =
+        targetHit.endpointEnd === 'start' ? targetRoad.points : targetRoad.points.slice().reverse();
+
+      const mergedPts = dedupSequentialPoints([...anchorSeq, ...extTail, ...targetSeq], 0.4);
+      const mergedJunctions = [...(anchorRoad.junctions ?? []), ...(targetRoad.junctions ?? [])];
+      const cleanName = anchorRoad.name.replace(/\s*\(\d+\)$/, '');
+
+      working[anchorIdx] = {
+        ...anchorRoad,
+        name: cleanName || anchorRoad.name,
+        points: mergedPts,
+        junctions: mergedJunctions.length > 0 ? mergedJunctions : undefined,
+        distanceMeters: computePathDistance(mergedPts),
+      };
+      working.splice(targetIdx, 1);
+      resultRoadId = anchorRoad.id;
+      return { nextRoads: working, selectedRoadId: resultRoadId };
+    }
+  }
+
+  // Snap final tip to mid-segment A–P–B on target road if applicable
+  if (targetHit) {
+    const targetIdx = working.findIndex((r) => r.id === targetHit!.roadId);
+    if (targetIdx >= 0) {
+      const { road: splitEx, insertedPoint } = insertTouchPointIntoRoad(
+        working[targetIdx],
+        targetHit.segIndex,
+        targetHit.point
+      );
+      working[targetIdx] = splitEx;
+      extTail[extTail.length - 1] = {
+        lat: insertedPoint.lat,
+        lng: insertedPoint.lng,
+        accuracy: 1.5,
+        timestamp: Date.now(),
+      };
+    }
+  }
+
+  // Extend anchorRoad cleanly
+  const newAnchorPoints =
+    anchor.end === 'end'
+      ? dedupSequentialPoints([...anchorRoad.points, ...extTail], 0.4)
+      : dedupSequentialPoints([...extTail.slice().reverse(), ...anchorRoad.points], 0.4);
+
+  const curAnchorIdx = working.findIndex((r) => r.id === anchorRoad.id);
+  working[curAnchorIdx] = {
+    ...anchorRoad,
+    points: newAnchorPoints,
+    distanceMeters: computePathDistance(newAnchorPoints),
+  };
+
+  // Split any roads crossed by the newly extended segment sequence
+  for (let ei = 0; ei < working.length; ei++) {
+    if (ei === curAnchorIdx) continue;
+    let ex = working[ei];
+    if (ex.points.length < 2) continue;
+    const hits: { newSegIdx: number; t: number; exSegIdx: number; u: number; point: { lat: number; lng: number } }[] = [];
+    for (let si = 0; si < clean.length - 1; si++) {
+      for (let sj = 0; sj < ex.points.length - 1; sj++) {
+        const hit = segmentIntersection(clean[si], clean[si + 1], ex.points[sj], ex.points[sj + 1]);
+        if (hit) {
+          hits.push({ newSegIdx: si, t: hit.t, exSegIdx: sj, u: hit.u, point: hit.point });
+        }
+      }
+    }
+    if (hits.length > 0) {
+      const exBySeg = hits.slice().sort((a, b) => b.exSegIdx - a.exSegIdx || b.u - a.u);
+      for (const h of exBySeg) {
+        ex = insertTouchPointIntoRoad(ex, h.exSegIdx, h.point).road;
+      }
+      working[ei] = ex;
+    }
+  }
+
+  return { nextRoads: working, selectedRoadId: resultRoadId };
+}
+
+export interface VehicleTourWaypoint {
+  roadId: string;
+  roadName: string;
+  roadIndex: number;
+  segIndex: number;
+  lat: number;
+  lng: number;
+  bearingDeg: number;
+  cumulativeMeters: number;
+}
+
+/**
+ * Generates an ordered, connected tour across all village roads at ~2m spacing
+ * so the Vehicle Simulator can slowly traverse every road segment in the village.
+ */
+export function buildVehicleTourWaypoints(
+  roads: VillageRoad[],
+  stepMeters = 2
+): VehicleTourWaypoint[] {
+  const validRoads = roads.filter((r) => r.points.length >= 2);
+  if (validRoads.length === 0) return [];
+
+  // Order roads via greedy nearest-endpoint chaining so the vehicle flows naturally through the village
+  const remaining = validRoads.slice();
+  const ordered: { road: VillageRoad; reverse: boolean }[] = [];
+  const first = remaining.shift()!;
+  ordered.push({ road: first, reverse: false });
+  let curTip = first.points[first.points.length - 1];
+
+  while (remaining.length > 0) {
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    let bestRev = false;
+    for (let i = 0; i < remaining.length; i++) {
+      const r = remaining[i];
+      const dStart = haversineMeters(curTip, r.points[0]);
+      const dEnd = haversineMeters(curTip, r.points[r.points.length - 1]);
+      if (dStart < bestDist) {
+        bestDist = dStart;
+        bestIdx = i;
+        bestRev = false;
+      }
+      if (dEnd < bestDist) {
+        bestDist = dEnd;
+        bestIdx = i;
+        bestRev = true;
+      }
+    }
+    const chosen = remaining.splice(bestIdx, 1)[0];
+    ordered.push({ road: chosen, reverse: bestRev });
+    curTip = bestRev ? chosen.points[0] : chosen.points[chosen.points.length - 1];
+  }
+
+  const tour: VehicleTourWaypoint[] = [];
+  let totalMeters = 0;
+
+  for (let rIdx = 0; rIdx < ordered.length; rIdx++) {
+    const { road, reverse } = ordered[rIdx];
+    const pts = road.points;
+    const segCount = pts.length - 1;
+    let prevPos: { lat: number; lng: number } | null = null;
+
+    for (let stepOrder = 0; stepOrder < segCount; stepOrder++) {
+      const segIndex = reverse ? segCount - 1 - stepOrder : stepOrder;
+      const a = reverse ? pts[segIndex + 1] : pts[segIndex];
+      const b = reverse ? pts[segIndex] : pts[segIndex + 1];
+      const segLen = haversineMeters(a, b);
+      const bearingDeg =
+        segLen >= 0.3
+          ? calculateBearing(a, b)
+          : tour[tour.length - 1]?.bearingDeg ?? 0;
+
+      if (stepOrder === 0) {
+        tour.push({
+          roadId: road.id,
+          roadName: road.name,
+          roadIndex: rIdx,
+          segIndex,
+          lat: a.lat,
+          lng: a.lng,
+          bearingDeg,
+          cumulativeMeters: totalMeters,
+        });
+        prevPos = a;
+      }
+
+      if (segLen < 0.3) continue;
+      const subSteps = Math.max(1, Math.ceil(segLen / stepMeters));
+      for (let s = 1; s <= subSteps; s++) {
+        const t = s / subSteps;
+        const lat = a.lat + (b.lat - a.lat) * t;
+        const lng = a.lng + (b.lng - a.lng) * t;
+        if (prevPos) {
+          totalMeters += haversineMeters(prevPos, { lat, lng });
+        }
+        prevPos = { lat, lng };
+        tour.push({
+          roadId: road.id,
+          roadName: road.name,
+          roadIndex: rIdx,
+          segIndex,
+          lat,
+          lng,
+          bearingDeg,
+          cumulativeMeters: totalMeters,
+        });
+      }
+    }
+  }
+
+  return tour;
+}
+
+/**
+ * Stamps vehicle accessibility (`car` or `no_car`) on a road segment (or entire road)
+ * and re-computes village road hierarchy cleanly.
+ */
+export function stampRoadSegmentAccess(
+  roads: VillageRoad[],
+  roadId: string,
+  segIndex: number | 'all',
+  access: VehicleSegmentAccess
+): VillageRoad[] {
+  const updated = roads.map((r) => {
+    if (r.id !== roadId || r.points.length < 2) return r;
+    const segCount = r.points.length - 1;
+    const cur: VehicleSegmentAccess[] =
+      r.segmentAccess && r.segmentAccess.length === segCount
+        ? r.segmentAccess.slice()
+        : Array<VehicleSegmentAccess>(segCount).fill('unmarked');
+
+    if (segIndex === 'all') {
+      for (let i = 0; i < segCount; i++) cur[i] = access;
+    } else if (segIndex >= 0 && segIndex < segCount) {
+      cur[segIndex] = access;
+    }
+
+    return {
+      ...r,
+      segmentAccess: cur,
+    };
+  });
+
+  return classifyVillageRoadHierarchy(updated);
+}
+
+/**
+ * Automatically identifies Village Main Roads vs Car Streets vs Narrow No-Car Galis
+ * by combining Car accessibility with graph connectivity (how many side lanes/galis connect
+ * into each car-accessible corridor).
+ */
+export function classifyVillageRoadHierarchy(roads: VillageRoad[]): VillageRoad[] {
+  if (roads.length === 0) return roads;
+
+  // Build spatial junction buckets (~8m) to detect which roads connect into each road
+  const SNAP_M = 8;
+  const buckets: { lat: number; lng: number; roadIds: Set<string> }[] = [];
+
+  for (const r of roads) {
+    for (const p of r.points) {
+      let matched = false;
+      for (const b of buckets) {
+        if (haversineMeters(p, b) <= SNAP_M) {
+          b.roadIds.add(r.id);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        buckets.push({ lat: p.lat, lng: p.lng, roadIds: new Set([r.id]) });
+      }
+    }
+  }
+
+  const connectedRoadsByRoadId = new Map<string, Set<string>>();
+  const junctionDegreeByRoadId = new Map<string, number>();
+
+  for (const r of roads) {
+    connectedRoadsByRoadId.set(r.id, new Set());
+    junctionDegreeByRoadId.set(r.id, 0);
+  }
+
+  for (const b of buckets) {
+    if (b.roadIds.size < 2) continue;
+    const list = Array.from(b.roadIds);
+    for (const rId of list) {
+      junctionDegreeByRoadId.set(rId, (junctionDegreeByRoadId.get(rId) ?? 0) + 1);
+      const set = connectedRoadsByRoadId.get(rId);
+      if (set) {
+        for (const otherId of list) {
+          if (otherId !== rId) set.add(otherId);
+        }
+      }
+    }
+  }
+
+  // Score every road that has at least some Car-passable stretch
+  const carScores = new Map<string, number>();
+  let topCarScore = 0;
+
+  for (const r of roads) {
+    const segCount = Math.max(1, r.points.length - 1);
+    const access = r.segmentAccess;
+    const carCount = access ? access.filter((a) => a === 'car').length : 0;
+    const carRatio = carCount / segCount;
+
+    if (carCount > 0 && carRatio >= 0.35) {
+      const connectedLanes = connectedRoadsByRoadId.get(r.id)?.size ?? 0;
+      const junctionPts = junctionDegreeByRoadId.get(r.id) ?? 0;
+      const surfaceBonus =
+        r.surface === 'asphalt' ? 35 : r.surface === 'concrete' ? 20 : r.surface === 'cobblestone' ? 8 : 0;
+      const carDistBonus = Math.min(1800, r.distanceMeters * carRatio) * 0.08;
+      const score = connectedLanes * 50 + junctionPts * 20 + carDistBonus + surfaceBonus;
+      carScores.set(r.id, score);
+      if (score > topCarScore) topCarScore = score;
+    }
+  }
+
+  return roads.map((r) => {
+    const access = r.segmentAccess;
+    if (!access || access.length === 0) {
+      return { ...r, roadRole: 'unmarked' as RoadHierarchyRole };
+    }
+    const carCount = access.filter((a) => a === 'car').length;
+    const noCarCount = access.filter((a) => a === 'no_car').length;
+
+    let role: RoadHierarchyRole = 'unmarked';
+    if (carCount > 0) {
+      const score = carScores.get(r.id) ?? 0;
+      const connectedLanes = connectedRoadsByRoadId.get(r.id)?.size ?? 0;
+      const isMainBackbone =
+        topCarScore > 0 &&
+        score >= Math.max(25, topCarScore * 0.58) &&
+        (connectedLanes >= 1 || carScores.size === 1);
+      role = isMainBackbone ? 'main' : 'car_street';
+    } else if (noCarCount > 0) {
+      role = 'narrow_lane';
+    }
+
+    return {
+      ...r,
+      roadRole: role,
+    };
+  });
+}
+
+export interface VehicleHierarchySummary {
+  mainRoadNames: string[];
+  mainRoadMeters: number;
+  carStreetMeters: number;
+  noCarMeters: number;
+  unmarkedMeters: number;
+  surveyedPercent: number;
+}
+
+export function summarizeVehicleHierarchy(roads: VillageRoad[]): VehicleHierarchySummary {
+  const mainRoadNames: string[] = [];
+  let mainRoadMeters = 0;
+  let carStreetMeters = 0;
+  let noCarMeters = 0;
+  let unmarkedMeters = 0;
+
+  for (const r of roads) {
+    if (r.points.length < 2) continue;
+    const segCount = r.points.length - 1;
+    const access = r.segmentAccess;
+    const isMain = r.roadRole === 'main';
+    if (isMain) mainRoadNames.push(r.name);
+
+    for (let i = 0; i < segCount; i++) {
+      const segLen = haversineMeters(r.points[i], r.points[i + 1]);
+      const st: VehicleSegmentAccess =
+        access && access.length === segCount ? access[i] : 'unmarked';
+      if (st === 'car') {
+        if (isMain) mainRoadMeters += segLen;
+        else carStreetMeters += segLen;
+      } else if (st === 'no_car') {
+        noCarMeters += segLen;
+      } else {
+        unmarkedMeters += segLen;
+      }
+    }
+  }
+
+  const total = mainRoadMeters + carStreetMeters + noCarMeters + unmarkedMeters;
+  const surveyed = mainRoadMeters + carStreetMeters + noCarMeters;
+  const surveyedPercent = total > 0 ? Math.round((surveyed / total) * 100) : 0;
+
+  return {
+    mainRoadNames,
+    mainRoadMeters,
+    carStreetMeters,
+    noCarMeters,
+    unmarkedMeters,
+    surveyedPercent,
+  };
+}
+
+
 

@@ -48,6 +48,52 @@ export interface AutoMapXOverlay {
   simPoint?: { lat: number; lng: number; headingDeg: number } | null;
 }
 
+export type RoadEditorTool = 'pan' | 'erase' | 'automap' | 'draw';
+
+export interface RoadEditorAutoMapSession {
+  active: boolean;
+  isRunning: boolean;
+  isPaused: boolean;
+  useLiveGps: boolean;
+  points: LatLngPoint[];
+  cursor: { lat: number; lng: number; headingDeg: number };
+  aheadTarget: {
+    lat: number;
+    lng: number;
+    distMeters: number;
+    roadName: string;
+    isEndpoint: boolean;
+    turnDeltaDeg: number;
+  } | null;
+}
+
+export interface RoadEditorConfig {
+  enabled: boolean;
+  tool: RoadEditorTool;
+  activeRoadId: string | null;
+  eraserRadiusMeters: number;
+  snapEnabled: boolean;
+  drawingPoints: LatLngPoint[];
+  snapTarget: { lat: number; lng: number; roadName: string } | null;
+  autoMapSession?: RoadEditorAutoMapSession | null;
+  onSelectRoad: (roadId: string) => void;
+  onTapEndpointForAutoMap?: (roadId: string, end: 'start' | 'end', lat: number, lng: number) => void;
+  onEraseStrokeStart: () => void;
+  onEraseAt: (lat: number, lng: number) => void;
+  onEraseStrokeEnd: () => void;
+  onDrawTapPoint: (lat: number, lng: number) => void;
+  onDrawFreehandStroke: (points: LatLngPoint[]) => void;
+  onPointerHover?: (lat: number, lng: number) => void;
+}
+
+export interface VehicleOverlayConfig {
+  active: boolean;
+  carOn: boolean;
+  currentRoadId: string | null;
+  simPoint: { lat: number; lng: number; headingDeg: number } | null;
+  onSelectRoad?: (roadId: string) => void;
+}
+
 interface VillageMapProps {
   roads: VillageRoad[];
   houses: VillageHouse[];
@@ -64,6 +110,11 @@ interface VillageMapProps {
   targetHouse: VillageHouse | null;
   darkMode?: boolean;
   isolateNavigation: boolean;
+  hideHouses?: boolean;
+  hideGpsMarker?: boolean;
+  cleanScreen?: boolean;
+  showVehicleHierarchy?: boolean;
+  vehicleOverlay?: VehicleOverlayConfig | null;
   activeInstruction: NavigationInstruction | null;
   distanceToNextTurnMeters: number | null;
   interactionMode: MapInteractionMode;
@@ -87,6 +138,8 @@ interface VillageMapProps {
   } | null;
   autoTripOverlay?: AutoTripOverlay | null;
   autoMapXOverlay?: AutoMapXOverlay | null;
+  liveRoadSnap?: { lat: number; lng: number; roadName: string; distMeters: number } | null;
+  roadEditor?: RoadEditorConfig | null;
 }
 
 const TILE_LAYERS: Record<
@@ -154,6 +207,11 @@ export default function VillageMap({
   targetHouse,
   darkMode = false,
   isolateNavigation,
+  hideHouses = false,
+  hideGpsMarker = false,
+  cleanScreen = false,
+  showVehicleHierarchy = false,
+  vehicleOverlay = null,
   activeInstruction,
   distanceToNextTurnMeters,
   interactionMode,
@@ -171,6 +229,8 @@ export default function VillageMap({
   focusTarget,
   autoTripOverlay = null,
   autoMapXOverlay = null,
+  liveRoadSnap = null,
+  roadEditor = null,
 }: VillageMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -180,8 +240,13 @@ export default function VillageMap({
   const walkLayerRef = useRef<L.LayerGroup | null>(null);
   const autoTripLayerRef = useRef<L.LayerGroup | null>(null);
   const autoMapXLayerRef = useRef<L.LayerGroup | null>(null);
+  const roadEditorLayerRef = useRef<L.LayerGroup | null>(null);
+  const editorTransientLayerRef = useRef<L.LayerGroup | null>(null);
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
   const gpsLayerRef = useRef<L.LayerGroup | null>(null);
+  const vehicleSimLayerRef = useRef<L.LayerGroup | null>(null);
+  const vehicleOverlayRef = useRef(vehicleOverlay);
+  vehicleOverlayRef.current = vehicleOverlay;
 
   const onMapClickRef = useRef(onMapClick);
   onMapClickRef.current = onMapClick;
@@ -195,6 +260,8 @@ export default function VillageMap({
   onViewChangeRef.current = onViewChange;
   const onUserDragRef = useRef(onUserDrag);
   onUserDragRef.current = onUserDrag;
+  const roadEditorRef = useRef(roadEditor);
+  roadEditorRef.current = roadEditor;
   const initialViewRef = useRef(initialView);
   const isProgrammaticMoveRef = useRef(false);
   const isProgrammaticRotateRef = useRef(false);
@@ -245,10 +312,15 @@ export default function VillageMap({
     walkLayerRef.current = L.layerGroup().addTo(map);
     autoTripLayerRef.current = L.layerGroup().addTo(map);
     autoMapXLayerRef.current = L.layerGroup().addTo(map);
+    roadEditorLayerRef.current = L.layerGroup().addTo(map);
+    editorTransientLayerRef.current = L.layerGroup().addTo(map);
     housesLayerRef.current = L.layerGroup().addTo(map);
     gpsLayerRef.current = L.layerGroup().addTo(map);
+    vehicleSimLayerRef.current = L.layerGroup().addTo(map);
 
     map.on('click', (e: L.LeafletMouseEvent) => {
+      const ed = roadEditorRef.current;
+      if (ed?.enabled && (ed.tool === 'erase' || ed.tool === 'draw')) return;
       onMapClickRef.current(e.latlng.lat, e.latlng.lng);
     });
 
@@ -357,11 +429,183 @@ export default function VillageMap({
     };
   }, [baseLayer]);
 
+  const isHandToolActive = Boolean(
+    roadEditor?.enabled && (roadEditor.tool === 'erase' || roadEditor.tool === 'draw')
+  );
+
   useEffect(() => {
-    if (containerRef.current) {
-      containerRef.current.style.cursor = interactionMode === 'browse' ? '' : 'crosshair';
+    const map = mapRef.current;
+    const container = containerRef.current;
+    if (!container) return;
+
+    if (isHandToolActive) {
+      container.style.cursor = roadEditor?.tool === 'erase' ? 'cell' : 'crosshair';
+      container.style.touchAction = 'none';
+      map?.dragging.disable();
+      map?.doubleClickZoom.disable();
+    } else {
+      container.style.cursor = interactionMode === 'browse' ? '' : 'crosshair';
+      container.style.touchAction = '';
+      map?.dragging.enable();
+      map?.doubleClickZoom.enable();
     }
-  }, [interactionMode]);
+  }, [interactionMode, isHandToolActive, roadEditor?.tool]);
+
+  // Native pointer listeners for silky hand-erase and hand-draw strokes (mouse & touchscreen)
+  useEffect(() => {
+    const container = containerRef.current;
+    const map = mapRef.current;
+    if (!container || !map) return;
+
+    const transient = editorTransientLayerRef.current;
+    if (!isHandToolActive) {
+      transient?.clearLayers();
+      return;
+    }
+
+    let pointerDownId: number | null = null;
+    let lastErasePt: { lat: number; lng: number } | null = null;
+    let drawStartScreen = { x: 0, y: 0 };
+    let drawDidDrag = false;
+    let drawStrokePts: LatLngPoint[] = [];
+
+    const toLatLng = (clientX: number, clientY: number) => {
+      const rect = container.getBoundingClientRect();
+      return map.containerPointToLatLng(L.point(clientX - rect.left, clientY - rect.top));
+    };
+
+    const renderTransient = (lat: number, lng: number) => {
+      const ed = roadEditorRef.current;
+      if (!transient || !ed?.enabled) return;
+      transient.clearLayers();
+      if (ed.tool === 'erase') {
+        L.circle([lat, lng], {
+          radius: ed.eraserRadiusMeters,
+          color: '#dc2626',
+          weight: 2,
+          dashArray: '4 4',
+          fillColor: '#ef4444',
+          fillOpacity: 0.18,
+          interactive: false,
+        }).addTo(transient);
+      } else if (ed.tool === 'draw' && drawStrokePts.length >= 2) {
+        L.polyline(
+          drawStrokePts.map((p) => [p.lat, p.lng] as [number, number]),
+          {
+            color: '#059669',
+            weight: 5,
+            opacity: 0.9,
+            dashArray: '6 4',
+            lineCap: 'round',
+            lineJoin: 'round',
+            interactive: false,
+          }
+        ).addTo(transient);
+      }
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button > 0) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-map-hud="true"], .leaflet-control')) return;
+      const ed = roadEditorRef.current;
+      if (!ed?.enabled || (ed.tool !== 'erase' && ed.tool !== 'draw')) return;
+
+      e.preventDefault();
+      pointerDownId = e.pointerId;
+      try {
+        container.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+
+      const ll = toLatLng(e.clientX, e.clientY);
+      if (ed.tool === 'erase') {
+        ed.onEraseStrokeStart();
+        ed.onEraseAt(ll.lat, ll.lng);
+        lastErasePt = { lat: ll.lat, lng: ll.lng };
+        renderTransient(ll.lat, ll.lng);
+      } else {
+        drawStartScreen = { x: e.clientX, y: e.clientY };
+        drawDidDrag = false;
+        drawStrokePts = [{ lat: ll.lat, lng: ll.lng, timestamp: Date.now() }];
+        ed.onPointerHover?.(ll.lat, ll.lng);
+        renderTransient(ll.lat, ll.lng);
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      const ed = roadEditorRef.current;
+      if (!ed?.enabled) return;
+      const ll = toLatLng(e.clientX, e.clientY);
+
+      if (ed.tool === 'erase') {
+        renderTransient(ll.lat, ll.lng);
+        if (pointerDownId === e.pointerId) {
+          const stepMin = Math.max(1.5, ed.eraserRadiusMeters * 0.25);
+          if (!lastErasePt || haversineMeters(lastErasePt, ll) >= stepMin) {
+            ed.onEraseAt(ll.lat, ll.lng);
+            lastErasePt = { lat: ll.lat, lng: ll.lng };
+          }
+        }
+      } else if (ed.tool === 'draw') {
+        ed.onPointerHover?.(ll.lat, ll.lng);
+        if (pointerDownId === e.pointerId) {
+          const distPx = Math.hypot(e.clientX - drawStartScreen.x, e.clientY - drawStartScreen.y);
+          if (distPx >= 10) drawDidDrag = true;
+          const prev = drawStrokePts[drawStrokePts.length - 1];
+          if (!prev || haversineMeters(prev, ll) >= 2.2) {
+            drawStrokePts.push({ lat: ll.lat, lng: ll.lng, timestamp: Date.now() });
+          }
+          renderTransient(ll.lat, ll.lng);
+        }
+      }
+    };
+
+    const finishStroke = (e: PointerEvent) => {
+      if (pointerDownId !== e.pointerId) return;
+      pointerDownId = null;
+      try {
+        container.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      const ed = roadEditorRef.current;
+      if (!ed?.enabled) return;
+      const ll = toLatLng(e.clientX, e.clientY);
+
+      if (ed.tool === 'erase') {
+        lastErasePt = null;
+        ed.onEraseStrokeEnd();
+      } else if (ed.tool === 'draw') {
+        transient?.clearLayers();
+        if (drawDidDrag && drawStrokePts.length >= 2) {
+          const last = drawStrokePts[drawStrokePts.length - 1];
+          if (haversineMeters(last, ll) >= 0.8) {
+            drawStrokePts.push({ lat: ll.lat, lng: ll.lng, timestamp: Date.now() });
+          }
+          ed.onDrawFreehandStroke(drawStrokePts);
+        } else {
+          ed.onDrawTapPoint(ll.lat, ll.lng);
+        }
+        drawStrokePts = [];
+        drawDidDrag = false;
+      }
+    };
+
+    container.addEventListener('pointerdown', onPointerDown);
+    container.addEventListener('pointermove', onPointerMove);
+    container.addEventListener('pointerup', finishStroke);
+    container.addEventListener('pointercancel', finishStroke);
+
+    return () => {
+      container.removeEventListener('pointerdown', onPointerDown);
+      container.removeEventListener('pointermove', onPointerMove);
+      container.removeEventListener('pointerup', finishStroke);
+      container.removeEventListener('pointercancel', finishStroke);
+      transient?.clearLayers();
+    };
+  }, [isHandToolActive]);
 
   useEffect(() => {
     if (!focusTarget || !mapRef.current) return;
@@ -419,26 +663,140 @@ export default function VillageMap({
     if (!group) return;
     group.clearLayers();
 
+    const isEditing = Boolean(roadEditor?.enabled);
+    const isVehicleSim = Boolean(vehicleOverlay?.active);
+
     for (const r of roads) {
       if (r.points.length < 2) continue;
       const latlngs = r.points.map((pt) => [pt.lat, pt.lng] as [number, number]);
       const isKachha = r.surface === 'unpaved';
       const isTrackedRoad = Boolean(isolateNavigation && targetHouse && r.id === targetHouse.roadId);
       const isMutedDuringTrack = Boolean(isolateNavigation && targetHouse && !isTrackedRoad);
+      const isSelectedForEdit = Boolean(isEditing && roadEditor?.activeRoadId === r.id);
+      const isVehicleActiveRoad = Boolean(isVehicleSim && vehicleOverlay?.currentRoadId === r.id);
+      const hasHierarchyAccess =
+        showVehicleHierarchy && r.segmentAccess && r.segmentAccess.length === r.points.length - 1;
 
-      const line = L.polyline(latlngs, {
-        color: isMutedDuringTrack ? '#64748b' : isKachha ? '#d97706' : '#0f766e',
-        weight: isMutedDuringTrack ? 3.5 : 5,
-        opacity: isMutedDuringTrack ? 0.5 : 0.92,
-        dashArray: isKachha ? '7 6' : undefined,
-        lineCap: 'round',
-        lineJoin: 'round',
-      });
-      line.bindTooltip(
-        `${r.name} · ${getSurfaceLabel(r.surface)} · ${formatDistance(r.distanceMeters)}`,
-        { sticky: true }
-      );
-      line.addTo(group);
+      if (hasHierarchyAccess && !isEditing && !isMutedDuringTrack) {
+        // Draw each contiguous run by Vehicle Access status (Main Road = Blue, Car = Green, No Car = Amber-Orange)
+        const access = r.segmentAccess!;
+        const isMain = r.roadRole === 'main';
+        let runStart = 0;
+        while (runStart < access.length) {
+          const st = access[runStart];
+          let runEnd = runStart;
+          while (runEnd + 1 < access.length && access[runEnd + 1] === st) {
+            runEnd++;
+          }
+          const slicePts = latlngs.slice(runStart, runEnd + 2);
+          const segColor =
+            st === 'car'
+              ? isMain
+                ? '#1d4ed8'
+                : '#059669'
+              : st === 'no_car'
+              ? '#ea580c'
+              : isKachha
+              ? '#d97706'
+              : '#0f766e';
+          const segWeight =
+            st === 'car' && isMain
+              ? isVehicleActiveRoad
+                ? 9
+                : 7.5
+              : isVehicleActiveRoad
+              ? 7
+              : 5;
+
+          if (st === 'car' && isMain) {
+            L.polyline(slicePts, {
+              color: '#1e3a8a',
+              weight: segWeight + 3,
+              opacity: 0.25,
+              lineCap: 'round',
+              lineJoin: 'round',
+              interactive: false,
+            }).addTo(group);
+          }
+
+          const segLine = L.polyline(slicePts, {
+            color: segColor,
+            weight: segWeight,
+            opacity: 0.96,
+            dashArray: st === 'no_car' ? '7 5' : undefined,
+            lineCap: 'round',
+            lineJoin: 'round',
+          });
+          if (isVehicleSim) {
+            segLine.on('click', (ev) => {
+              L.DomEvent.stopPropagation(ev);
+              vehicleOverlayRef.current?.onSelectRoad?.(r.id);
+            });
+          }
+          const roleTag =
+            st === 'car'
+              ? isMain
+                ? 'Main Road (Car Goes)'
+                : 'Car Accessible'
+              : st === 'no_car'
+              ? 'No Car (Narrow Lane)'
+              : 'Unmarked';
+          segLine.bindTooltip(`${r.name} · ${roleTag} · ${formatDistance(r.distanceMeters)}`, {
+            sticky: true,
+          });
+          segLine.addTo(group);
+
+          runStart = runEnd + 1;
+        }
+      } else {
+        const line = L.polyline(latlngs, {
+          color: isSelectedForEdit
+            ? '#0284c7'
+            : isVehicleActiveRoad
+            ? '#7c3aed'
+            : isMutedDuringTrack
+            ? '#64748b'
+            : isKachha
+            ? '#d97706'
+            : '#0f766e',
+          weight: isSelectedForEdit || isVehicleActiveRoad ? 7 : isMutedDuringTrack ? 3.5 : 5,
+          opacity:
+            isSelectedForEdit || isVehicleActiveRoad
+              ? 0.98
+              : isEditing
+              ? 0.65
+              : isMutedDuringTrack
+              ? 0.5
+              : 0.92,
+          dashArray: isKachha ? '7 6' : undefined,
+          lineCap: 'round',
+          lineJoin: 'round',
+        });
+        if (
+          isEditing &&
+          (roadEditor?.tool === 'pan' || roadEditor?.tool === 'automap') &&
+          !roadEditor?.autoMapSession?.active
+        ) {
+          line.on('click', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            roadEditorRef.current?.onSelectRoad(r.id);
+          });
+        } else if (isVehicleSim) {
+          line.on('click', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            vehicleOverlayRef.current?.onSelectRoad?.(r.id);
+          });
+        }
+        line.bindTooltip(
+          isEditing
+            ? `${r.name} · ${r.points.length} pts${isSelectedForEdit ? ' (Selected)' : ' · Tap to select'}`
+            : isVehicleSim
+            ? `${r.name} · Tap to jump Vehicle here`
+            : `${r.name} · ${getSurfaceLabel(r.surface)} · ${formatDistance(r.distanceMeters)}`,
+          { sticky: true }
+        );
+        line.addTo(group);
+      }
 
       for (const j of r.junctions ?? []) {
         const branches = j.branches ?? [];
@@ -534,13 +892,300 @@ export default function VillageMap({
           .addTo(group);
       }
     }
-  }, [roads, isolateNavigation, targetHouse]);
+  }, [
+    roads,
+    isolateNavigation,
+    targetHouse,
+    roadEditor?.enabled,
+    roadEditor?.activeRoadId,
+    roadEditor?.tool,
+    roadEditor?.autoMapSession?.active,
+    showVehicleHierarchy,
+    vehicleOverlay?.active,
+    vehicleOverlay?.currentRoadId,
+  ]);
 
-  // Render Houses: in isolated navigation mode, ONLY render targetHouse!
+  // Render Road Editor Vertices, Drawn Line Preview & Live Magnetic Snap Target (between A & B)
+  useEffect(() => {
+    const group = roadEditorLayerRef.current;
+    if (!group) return;
+    group.clearLayers();
+
+    if (roadEditor?.enabled) {
+      const amxSession = roadEditor.autoMapSession;
+
+      // Render interactive AutoMap path, directional cursor & Ahead Target guidance when active
+      if (amxSession?.active) {
+        const pts = amxSession.points;
+        const cur = amxSession.cursor;
+
+        if (pts.length >= 2) {
+          const latlngs = pts.map((p) => [p.lat, p.lng] as [number, number]);
+          L.polyline(latlngs, {
+            color: '#1e1b4b',
+            weight: 10,
+            opacity: 0.25,
+            lineCap: 'round',
+            lineJoin: 'round',
+            interactive: false,
+          }).addTo(group);
+
+          L.polyline(latlngs, {
+            color: '#06b6d4',
+            weight: 6,
+            opacity: 0.96,
+            lineCap: 'round',
+            lineJoin: 'round',
+            interactive: false,
+          }).addTo(group);
+        }
+
+        if (pts.length >= 1) {
+          const tail = pts[pts.length - 1];
+          if (haversineMeters(tail, cur) >= 0.3) {
+            L.polyline(
+              [
+                [tail.lat, tail.lng],
+                [cur.lat, cur.lng],
+              ],
+              {
+                color: '#06b6d4',
+                weight: 6,
+                opacity: 0.96,
+                lineCap: 'round',
+                interactive: false,
+              }
+            ).addTo(group);
+          }
+
+          const anchorBadge = L.divIcon({
+            className: 'grampath-edit-amx-anchor',
+            iconSize: [44, 20],
+            iconAnchor: [22, 10],
+            html: `<div style="height:20px;padding:0 7px;border-radius:6px;background:#059669;color:#ffffff;border:2px solid #ffffff;font-size:10px;font-weight:700;font-family:'DM Sans',sans-serif;display:inline-flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(15,23,42,0.35);">Start</div>`,
+          });
+          L.marker([pts[0].lat, pts[0].lng], {
+            icon: anchorBadge,
+            interactive: false,
+            zIndexOffset: 560,
+          }).addTo(group);
+        }
+
+        // Ahead Target Detector: show dotted path + pulsing lock ring onto upcoming cut end / road
+        if (amxSession.aheadTarget) {
+          const tgt = amxSession.aheadTarget;
+          const isReady = tgt.distMeters <= 10;
+          const guideColor = isReady ? '#10b981' : '#f59e0b';
+
+          L.polyline(
+            [
+              [cur.lat, cur.lng],
+              [tgt.lat, tgt.lng],
+            ],
+            {
+              color: guideColor,
+              weight: 3.5,
+              opacity: 0.92,
+              dashArray: '6 6',
+              lineCap: 'round',
+              interactive: false,
+            }
+          ).addTo(group);
+
+          L.circleMarker([tgt.lat, tgt.lng], {
+            radius: isReady ? 13 : 10,
+            color: '#ffffff',
+            weight: 2.5,
+            fillColor: guideColor,
+            fillOpacity: 0.92,
+            interactive: false,
+          })
+            .bindTooltip(
+              `${isReady ? 'Join Ready' : 'Ahead'}: ${Math.round(tgt.distMeters)}m · ${tgt.roadName}`
+            )
+            .addTo(group);
+        }
+
+        // Forward heading ray + moving AutoMap directional arrow
+        const rayTip = offsetCoord(cur, cur.headingDeg, 26);
+        L.polyline(
+          [
+            [cur.lat, cur.lng],
+            [rayTip.lat, rayTip.lng],
+          ],
+          {
+            color: amxSession.useLiveGps ? '#0284c7' : '#7c3aed',
+            weight: 3,
+            opacity: 0.85,
+            dashArray: '5 5',
+            lineCap: 'round',
+            interactive: false,
+          }
+        ).addTo(group);
+
+        const bg = amxSession.useLiveGps
+          ? '#0284c7'
+          : amxSession.isRunning && !amxSession.isPaused
+          ? '#7c3aed'
+          : '#0f766e';
+        const halo = amxSession.useLiveGps
+          ? 'rgba(2,132,199,0.28)'
+          : amxSession.isRunning && !amxSession.isPaused
+          ? 'rgba(124,58,237,0.28)'
+          : 'rgba(15,118,110,0.24)';
+
+        const cursorIcon = L.divIcon({
+          className: 'grampath-edit-amx-cursor',
+          iconSize: [36, 36],
+          iconAnchor: [18, 18],
+          html: `<div style="width:36px;height:36px;border-radius:999px;background:${halo};display:flex;align-items:center;justify-content:center;"><div style="width:24px;height:24px;border-radius:999px;background:${bg};border:2.5px solid #ffffff;box-shadow:0 2px 8px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;"><svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg></div></div>`,
+        });
+
+        L.marker([cur.lat, cur.lng], {
+          icon: cursorIcon,
+          zIndexOffset: 980,
+          rotateWithView: true,
+          rotation: (cur.headingDeg * Math.PI) / 180,
+          interactive: false,
+        }).addTo(group);
+        return;
+      }
+
+      // Show interior vertices on the selected road
+      if (roadEditor.activeRoadId) {
+        const activeR = roads.find((r) => r.id === roadEditor.activeRoadId);
+        if (activeR && activeR.points.length > 2) {
+          const pts = activeR.points;
+          const step = pts.length > 100 ? Math.ceil(pts.length / 100) : 1;
+          for (let i = 1; i < pts.length - 1; i++) {
+            if (i % step !== 0) continue;
+            L.circleMarker([pts[i].lat, pts[i].lng], {
+              radius: 3.2,
+              color: '#ffffff',
+              weight: 1,
+              fillColor: '#0284c7',
+              fillOpacity: 1,
+              interactive: false,
+            }).addTo(group);
+          }
+        }
+      }
+
+      // Render large tappable endpoint dots ("Bindu") across all draft roads so clicking any tip launches AutoMap!
+      const canTapEndpoints =
+        (roadEditor.tool === 'pan' || roadEditor.tool === 'automap') &&
+        Boolean(roadEditor.onTapEndpointForAutoMap);
+
+      for (const r of roads) {
+        if (r.points.length < 2) continue;
+        const isActive = r.id === roadEditor.activeRoadId;
+        const endpoints: { end: 'start' | 'end'; pt: LatLngPoint }[] = [
+          { end: 'start', pt: r.points[0] },
+          { end: 'end', pt: r.points[r.points.length - 1] },
+        ];
+
+        for (const ep of endpoints) {
+          const fill = ep.end === 'start' ? '#059669' : '#7c3aed';
+          if (canTapEndpoints) {
+            // Subtle outer glow ring so cut ends ("Bindu") stand out clearly
+            L.circleMarker([ep.pt.lat, ep.pt.lng], {
+              radius: isActive ? 14 : 11,
+              color: fill,
+              weight: 2,
+              opacity: 0.45,
+              fillColor: fill,
+              fillOpacity: 0.14,
+              interactive: false,
+            }).addTo(group);
+          }
+
+          const nodeMarker = L.circleMarker([ep.pt.lat, ep.pt.lng], {
+            radius: canTapEndpoints ? (isActive ? 8.5 : 7) : 5.5,
+            color: '#ffffff',
+            weight: 2.5,
+            fillColor: fill,
+            fillOpacity: 1,
+            interactive: canTapEndpoints,
+          });
+
+          if (canTapEndpoints) {
+            nodeMarker.bindTooltip(`Tap point to start AutoMap (${r.name})`, {
+              direction: 'top',
+            });
+            nodeMarker.on('click', (ev) => {
+              L.DomEvent.stopPropagation(ev);
+              roadEditorRef.current?.onTapEndpointForAutoMap?.(
+                r.id,
+                ep.end,
+                ep.pt.lat,
+                ep.pt.lng
+              );
+            });
+          }
+          nodeMarker.addTo(group);
+        }
+      }
+
+      if (roadEditor.drawingPoints.length >= 2) {
+        L.polyline(
+          roadEditor.drawingPoints.map((p) => [p.lat, p.lng] as [number, number]),
+          {
+            color: '#059669',
+            weight: 6,
+            opacity: 0.95,
+            lineCap: 'round',
+            lineJoin: 'round',
+            interactive: false,
+          }
+        ).addTo(group);
+      }
+      for (const pt of roadEditor.drawingPoints) {
+        L.circleMarker([pt.lat, pt.lng], {
+          radius: 5,
+          color: '#ffffff',
+          weight: 2,
+          fillColor: '#059669',
+          fillOpacity: 1,
+          interactive: false,
+        }).addTo(group);
+      }
+
+      if (roadEditor.snapTarget) {
+        const st = roadEditor.snapTarget;
+        L.circleMarker([st.lat, st.lng], {
+          radius: 9,
+          color: '#ffffff',
+          weight: 2.5,
+          fillColor: '#10b981',
+          fillOpacity: 0.95,
+          interactive: false,
+        })
+          .bindTooltip(`Touch ${st.roadName}`)
+          .addTo(group);
+      }
+      return;
+    }
+
+    if (liveRoadSnap) {
+      L.circleMarker([liveRoadSnap.lat, liveRoadSnap.lng], {
+        radius: 9,
+        color: '#ffffff',
+        weight: 2.5,
+        fillColor: '#10b981',
+        fillOpacity: 0.9,
+        interactive: false,
+      })
+        .bindTooltip(`Touch ${liveRoadSnap.roadName} (${Math.round(liveRoadSnap.distMeters)}m)`)
+        .addTo(group);
+    }
+  }, [roadEditor, roads, liveRoadSnap]);
+
+  // Render Houses: hidden completely in Clean Map View (`hideHouses`), or isolated to targetHouse during navigation
   useEffect(() => {
     const group = housesLayerRef.current;
     if (!group) return;
     group.clearLayers();
+    if (hideHouses) return;
 
     let visibleHouses: VillageHouse[];
     if (isolateNavigation && targetHouse) {
@@ -640,7 +1285,18 @@ export default function VillageMap({
       marker.bindPopup(popupEl);
       marker.addTo(group);
     }
-  }, [houses, draftHouses, autoTripOverlay, autoMapXOverlay, startHouse, targetHouse, isolateNavigation, routeResult, darkMode]);
+  }, [
+    houses,
+    draftHouses,
+    autoTripOverlay,
+    autoMapXOverlay,
+    startHouse,
+    targetHouse,
+    isolateNavigation,
+    hideHouses,
+    routeResult,
+    darkMode,
+  ]);
 
   // Render Active Walk Segments (each segment draws independently so Pause->Resume jumps never bridge with a straight line)
   useEffect(() => {
@@ -1385,6 +2041,7 @@ export default function VillageMap({
     const group = gpsLayerRef.current;
     if (!group) return;
     group.clearLayers();
+    if (hideGpsMarker) return;
 
     if (currentGps.accuracy && currentGps.accuracy > 0 && currentGps.accuracy < 150) {
       L.circle([currentGps.lat, currentGps.lng], {
@@ -1421,7 +2078,40 @@ export default function VillageMap({
         .bindTooltip('You')
         .addTo(group);
     }
-  }, [currentGps, userHeadingDeg]);
+  }, [currentGps, userHeadingDeg, hideGpsMarker]);
+
+  // Render Animated Vehicle Simulator Marker (Car ON vs Narrow No-Car Mode)
+  useEffect(() => {
+    const group = vehicleSimLayerRef.current;
+    if (!group) return;
+    group.clearLayers();
+    if (!vehicleOverlay?.active || !vehicleOverlay.simPoint) return;
+
+    const sp = vehicleOverlay.simPoint;
+    const isCar = vehicleOverlay.carOn;
+    const bg = isCar ? '#059669' : '#ea580c';
+    const halo = isCar ? 'rgba(16,185,129,0.3)' : 'rgba(234,88,12,0.28)';
+    const badgeSvg = isCar
+      ? `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/></svg>`
+      : `<svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg>`;
+
+    const vehIcon = L.divIcon({
+      className: 'grampath-vehicle-sim',
+      iconSize: [42, 42],
+      iconAnchor: [21, 21],
+      html: `<div style="width:42px;height:42px;border-radius:999px;background:${halo};display:flex;align-items:center;justify-content:center;"><div style="width:30px;height:30px;border-radius:999px;background:${bg};border:2.5px solid #ffffff;box-shadow:0 3px 10px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;">${badgeSvg}</div></div>`,
+    });
+
+    L.marker([sp.lat, sp.lng], {
+      icon: vehIcon,
+      zIndexOffset: 990,
+      rotateWithView: !isCar,
+      rotation: isCar ? 0 : (sp.headingDeg * Math.PI) / 180,
+      interactive: false,
+    })
+      .bindTooltip(isCar ? 'CAR ON (Car Fits Here)' : 'CAR OFF (Narrow / No Car)')
+      .addTo(group);
+  }, [vehicleOverlay]);
 
   return (
     <div
@@ -1430,136 +2120,140 @@ export default function VillageMap({
       <div ref={containerRef} className="w-full h-full z-0" />
 
       {/* Live GPS Precision Readout & Quick Controls (Top Left) */}
-      <div
-        className={`absolute ${
-          topControlsOffset ? 'top-14' : 'top-2.5'
-        } left-2.5 z-[450] pointer-events-none flex flex-col gap-1 items-start transition-all`}
-      >
-        <div className="flex items-center gap-1.5 pointer-events-auto">
-          <div
-            className={`px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-mono tabular-nums font-semibold shadow-sm border whitespace-nowrap ${
-              gpsQuality.quality === 'ultra'
-                ? 'bg-emerald-900/90 text-emerald-100 border-emerald-700'
-                : gpsQuality.quality === 'good'
-                ? 'bg-white/95 dark:bg-slate-900/95 text-slate-800 dark:text-slate-100 border-slate-200 dark:border-slate-700'
-                : 'bg-amber-50/95 dark:bg-amber-950/90 text-amber-900 dark:text-amber-200 border-amber-300 dark:border-amber-700'
-            }`}
-          >
-            GPS {gpsQuality.label}
-            {gpsQuality.quality === 'ultra' ? ' · ≤5m' : ''}
-          </div>
-
-          {onCenterGps && (
-            <button
-              type="button"
-              onClick={onCenterGps}
-              title={
-                isFollowingGps
-                  ? 'Following live GPS (drag map for free mode)'
-                  : 'Free map mode — tap to re-center on GPS'
-              }
-              className={`px-2.5 py-1 rounded-lg border shadow-sm cursor-pointer inline-flex items-center gap-1 text-[10px] sm:text-[11px] font-semibold transition-colors ${
-                isFollowingGps
-                  ? 'bg-sky-600 text-white border-sky-700 hover:bg-sky-700'
-                  : 'bg-white/95 dark:bg-slate-900/95 text-slate-800 dark:text-slate-100 border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+      {!cleanScreen && (
+        <div
+          className={`absolute ${
+            topControlsOffset ? 'top-14' : 'top-2.5'
+          } left-2.5 z-[450] pointer-events-none flex flex-col gap-1 items-start transition-all`}
+        >
+          <div className="flex items-center gap-1.5 pointer-events-auto">
+            <div
+              className={`px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-mono tabular-nums font-semibold shadow-sm border whitespace-nowrap ${
+                gpsQuality.quality === 'ultra'
+                  ? 'bg-emerald-900/90 text-emerald-100 border-emerald-700'
+                  : gpsQuality.quality === 'good'
+                  ? 'bg-white/95 dark:bg-slate-900/95 text-slate-800 dark:text-slate-100 border-slate-200 dark:border-slate-700'
+                  : 'bg-amber-50/95 dark:bg-amber-950/90 text-amber-900 dark:text-amber-200 border-amber-300 dark:border-amber-700'
               }`}
             >
-              <Crosshair className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{isFollowingGps ? 'Follow' : 'Center'}</span>
+              GPS {gpsQuality.label}
+              {gpsQuality.quality === 'ultra' ? ' · ≤5m' : ''}
+            </div>
+
+            {onCenterGps && (
+              <button
+                type="button"
+                onClick={onCenterGps}
+                title={
+                  isFollowingGps
+                    ? 'Following live GPS (drag map for free mode)'
+                    : 'Free map mode — tap to re-center on GPS'
+                }
+                className={`px-2.5 py-1 rounded-lg border shadow-sm cursor-pointer inline-flex items-center gap-1 text-[10px] sm:text-[11px] font-semibold transition-colors ${
+                  isFollowingGps
+                    ? 'bg-sky-600 text-white border-sky-700 hover:bg-sky-700'
+                    : 'bg-white/95 dark:bg-slate-900/95 text-slate-800 dark:text-slate-100 border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+              >
+                <Crosshair className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">{isFollowingGps ? 'Follow' : 'Center'}</span>
+              </button>
+            )}
+          </div>
+
+          {isolateNavigation && targetHouse && onExitNavigation && (
+            <button
+              type="button"
+              onClick={onExitNavigation}
+              className="pointer-events-auto px-2.5 py-1 rounded-lg bg-white/95 dark:bg-slate-900/95 hover:bg-red-50 dark:hover:bg-red-950/70 text-red-700 dark:text-red-400 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold shadow-sm cursor-pointer whitespace-nowrap"
+            >
+              Exit {targetHouse.houseNumber} · Show All
             </button>
           )}
         </div>
-
-        {isolateNavigation && targetHouse && onExitNavigation && (
-          <button
-            type="button"
-            onClick={onExitNavigation}
-            className="pointer-events-auto px-2.5 py-1 rounded-lg bg-white/95 dark:bg-slate-900/95 hover:bg-red-50 dark:hover:bg-red-950/70 text-red-700 dark:text-red-400 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold shadow-sm cursor-pointer whitespace-nowrap"
-          >
-            Exit {targetHouse.houseNumber} · Show All
-          </button>
-        )}
-      </div>
+      )}
 
       {/* Layer Switcher & Map Rotation / Compass Controls (Top Right) */}
-      <div
-        className={`absolute ${
-          topControlsOffset ? 'top-14' : 'top-2.5'
-        } right-2.5 z-[400] flex flex-col items-end gap-1.5 transition-all`}
-      >
-        <div className="flex items-center gap-0.5 p-0.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur-sm border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm">
-          {(Object.keys(TILE_LAYERS) as BaseLayerId[]).map((id) => (
+      {!cleanScreen && (
+        <div
+          className={`absolute ${
+            topControlsOffset ? 'top-14' : 'top-2.5'
+          } right-2.5 z-[400] flex flex-col items-end gap-1.5 transition-all`}
+        >
+          <div className="flex items-center gap-0.5 p-0.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur-sm border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm">
+            {(Object.keys(TILE_LAYERS) as BaseLayerId[]).map((id) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => handleSelectBaseLayer(id)}
+                className={`px-1.5 sm:px-2 py-0.5 sm:py-1 text-[10px] sm:text-[11px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  baseLayer === id
+                    ? 'bg-slate-900 dark:bg-emerald-600 text-white'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+              >
+                {TILE_LAYERS[id].label}
+              </button>
+            ))}
+          </div>
+
+          {/* Map Rotation Bar: Free Twist/Rotate or North-Up / Heading-Up */}
+          <div className="flex items-center gap-0.5 p-0.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur-sm border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm">
             <button
-              key={id}
               type="button"
-              onClick={() => handleSelectBaseLayer(id)}
-              className={`px-1.5 sm:px-2 py-0.5 sm:py-1 text-[10px] sm:text-[11px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                baseLayer === id
-                  ? 'bg-slate-900 dark:bg-emerald-600 text-white'
-                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800'
+              onClick={() => setBearingManually(mapBearing - 45)}
+              title="Rotate map left 45° (or two-finger twist)"
+              className="p-1 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-md cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (targetHouse && !autoRotateHeading && mapBearing === 0) {
+                  setAutoRotateHeading(true);
+                } else {
+                  setBearingManually(0);
+                }
+              }}
+              title={
+                autoRotateHeading
+                  ? 'Heading-Up active · Tap for North-Up'
+                  : mapBearing !== 0
+                  ? 'Rotated · Tap to reset North-Up'
+                  : targetHouse
+                  ? 'North-Up (Default) · Tap for Heading-Up auto-rotate'
+                  : 'North-Up'
+              }
+              className={`px-1.5 py-0.5 rounded-md inline-flex items-center gap-1 text-[10px] font-semibold cursor-pointer transition-colors ${
+                autoRotateHeading
+                  ? 'bg-emerald-700 text-white'
+                  : mapBearing !== 0
+                  ? 'bg-amber-100 dark:bg-amber-900/60 text-amber-900 dark:text-amber-200'
+                  : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
               }`}
             >
-              {TILE_LAYERS[id].label}
+              <Compass
+                className="w-3.5 h-3.5 transition-transform"
+                style={{ transform: `rotate(${mapBearing}deg)` }}
+              />
+              <span className="font-mono tabular-nums">
+                {autoRotateHeading ? 'Dir' : mapBearing !== 0 ? `${mapBearing}°` : 'N'}
+              </span>
             </button>
-          ))}
+
+            <button
+              type="button"
+              onClick={() => setBearingManually(mapBearing + 45)}
+              title="Rotate map right 45° (or two-finger twist)"
+              className="p-1 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-md cursor-pointer"
+            >
+              <RotateCw className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
-
-        {/* Map Rotation Bar: Free Twist/Rotate or North-Up / Heading-Up */}
-        <div className="flex items-center gap-0.5 p-0.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur-sm border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm">
-          <button
-            type="button"
-            onClick={() => setBearingManually(mapBearing - 45)}
-            title="Rotate map left 45° (or two-finger twist)"
-            className="p-1 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-md cursor-pointer"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              if (targetHouse && !autoRotateHeading && mapBearing === 0) {
-                setAutoRotateHeading(true);
-              } else {
-                setBearingManually(0);
-              }
-            }}
-            title={
-              autoRotateHeading
-                ? 'Heading-Up active · Tap for North-Up'
-                : mapBearing !== 0
-                ? 'Rotated · Tap to reset North-Up'
-                : targetHouse
-                ? 'North-Up (Default) · Tap for Heading-Up auto-rotate'
-                : 'North-Up'
-            }
-            className={`px-1.5 py-0.5 rounded-md inline-flex items-center gap-1 text-[10px] font-semibold cursor-pointer transition-colors ${
-              autoRotateHeading
-                ? 'bg-emerald-700 text-white'
-                : mapBearing !== 0
-                ? 'bg-amber-100 dark:bg-amber-900/60 text-amber-900 dark:text-amber-200'
-                : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
-            }`}
-          >
-            <Compass
-              className="w-3.5 h-3.5 transition-transform"
-              style={{ transform: `rotate(${mapBearing}deg)` }}
-            />
-            <span className="font-mono tabular-nums">
-              {autoRotateHeading ? 'Dir' : mapBearing !== 0 ? `${mapBearing}°` : 'N'}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setBearingManually(mapBearing + 45)}
-            title="Rotate map right 45° (or two-finger twist)"
-            className="p-1 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-md cursor-pointer"
-          >
-            <RotateCw className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </div>
+      )}
 
       {/* Real-Time Turn + Remaining Distance + Movement Status HUD */}
       {targetHouse && activeInstruction && (() => {

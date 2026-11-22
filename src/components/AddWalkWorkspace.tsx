@@ -14,6 +14,7 @@ import {
   Crosshair,
   Footprints,
   GitBranch,
+  Link2,
   Minus,
   Pause,
   Pencil,
@@ -109,6 +110,8 @@ interface AddWalkWorkspaceProps {
   }) => void;
   nextSuggestedHouse: string;
   onLocateMe: () => void;
+  nearestRoadSnap?: { roadName: string; distMeters: number } | null;
+  onSnapToNearestRoad?: () => void;
   mapSlot: ReactNode;
 }
 
@@ -176,6 +179,8 @@ export default function AddWalkWorkspace({
   onSaveWalkedRoad,
   nextSuggestedHouse,
   onLocateMe,
+  nearestRoadSnap = null,
+  onSnapToNearestRoad,
   mapSlot,
 }: AddWalkWorkspaceProps) {
   const [houseInput, setHouseInput] = useState(nextSuggestedHouse || '1');
@@ -361,6 +366,18 @@ export default function AddWalkWorkspace({
           >
             <Crosshair className="w-3.5 h-3.5" />
           </button>
+
+          {nearestRoadSnap && onSnapToNearestRoad && (
+            <button
+              type="button"
+              onClick={onSnapToNearestRoad}
+              title={`Snap & touch ${nearestRoadSnap.roadName} (${Math.round(nearestRoadSnap.distMeters)}m away) between its points`}
+              className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold inline-flex items-center gap-1 whitespace-nowrap shrink-0 shadow-xs cursor-pointer"
+            >
+              <Link2 className="w-3.5 h-3.5" />
+              <span>Touch {nearestRoadSnap.roadName}</span>
+            </button>
+          )}
         </div>
 
         {/* Live Telemetry & Recording Controls */}
