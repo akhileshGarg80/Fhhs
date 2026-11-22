@@ -1,9 +1,12 @@
 import {
   ArrowUp,
+  Bike,
+  Car,
   CornerUpLeft,
   CornerUpRight,
   Crosshair,
   Flag,
+  Footprints,
   LocateFixed,
   Navigation,
   Play,
@@ -16,6 +19,7 @@ import {
 import { useMemo } from 'react';
 import type {
   NavigationInstruction,
+  TravelMode,
   TurnDirection,
   VillageHouse,
   VillageRouteResult,
@@ -54,6 +58,9 @@ interface NavigationPanelProps {
   isPickingSpot: boolean;
   onToggleLiveGps: () => void;
   onTogglePickSpot: () => void;
+  travelMode: TravelMode;
+  onChangeTravelMode: (mode: TravelMode) => void;
+  readOnlyPublic?: boolean;
   targetHouse: VillageHouse | null;
   routeResult: VillageRouteResult | null;
   routeOptions: VillageRouteResult[];
@@ -79,6 +86,9 @@ export default function NavigationPanel({
   isPickingSpot,
   onToggleLiveGps,
   onTogglePickSpot,
+  travelMode,
+  onChangeTravelMode,
+  readOnlyPublic = false,
   targetHouse,
   routeResult,
   routeOptions,
@@ -110,14 +120,41 @@ export default function NavigationPanel({
       ? routeResult.instructions[Math.min(currentStepIndex, routeResult.instructions.length - 1)]
       : null;
 
+  const arriveTargetPt =
+    routeResult?.carPartialStop && routeResult.carStopPoint
+      ? routeResult.carStopPoint
+      : targetHouse
+      ? { lat: targetHouse.roadLat, lng: targetHouse.roadLng }
+      : null;
+
   const isArrived =
     activeInstruction?.turnType === 'arrive' &&
-    targetHouse != null &&
-    haversineMeters(userLocation, { lat: targetHouse.roadLat, lng: targetHouse.roadLng }) <= 22;
+    arriveTargetPt != null &&
+    haversineMeters(userLocation, arriveTargetPt) <= 22;
+
+  const remainingCarMinutes = liveProgress
+    ? Math.max(1, Math.round(liveProgress.remainingMeters / 330))
+    : routeResult?.carMinutes ??
+      Math.max(1, Math.round((routeResult?.totalDistanceMeters ?? 0) / 330));
+
+  const formatModeEta = (
+    distMeters: number,
+    walkMin: number,
+    bikeMin: number,
+    carMin?: number
+  ): string => {
+    if (travelMode === 'car') {
+      return `${carMin ?? Math.max(1, Math.round(distMeters / 330))}m car`;
+    }
+    if (travelMode === 'bike') {
+      return `${bikeMin}m bike`;
+    }
+    return `${walkMin}m walk`;
+  };
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 overflow-y-auto transition-colors">
-      {/* User Location Header */}
+      {/* User Location + Travel Mode Header */}
       <div className="p-4 border-b border-slate-200 dark:border-slate-800 space-y-2.5">
         <div>
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
@@ -130,6 +167,40 @@ export default function NavigationPanel({
           <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
             My Spot: {userLocation.lat.toFixed(5)}, {userLocation.lng.toFixed(5)}
           </p>
+        </div>
+
+        {/* Travel Mode Switcher: Car | Bike | Walk */}
+        <div
+          role="group"
+          aria-label="Travel Mode"
+          className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700"
+        >
+          {(
+            [
+              { id: 'car', label: 'Car', Icon: Car },
+              { id: 'bike', label: 'Bike', Icon: Bike },
+              { id: 'walk', label: 'Walk', Icon: Footprints },
+            ] as const
+          ).map(({ id, label, Icon }) => {
+            const active = travelMode === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => onChangeTravelMode(id)}
+                className={`py-1.5 px-2 rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                  active
+                    ? id === 'car'
+                      ? 'bg-blue-700 text-white shadow-xs'
+                      : 'bg-emerald-700 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5 shrink-0" />
+                <span>{label}</span>
+              </button>
+            );
+          })}
         </div>
 
         <div className="grid grid-cols-2 gap-2">
@@ -179,7 +250,9 @@ export default function NavigationPanel({
                 {targetHouse.roadName} · {targetHouse.villageName}
               </div>
               <div className="text-[11px] text-emerald-700 dark:text-emerald-400 font-medium mt-0.5">
-                Isolated view: tracking only this house
+                {travelMode === 'car'
+                  ? 'Car mode: following saved car roads'
+                  : `${travelMode === 'bike' ? 'Bike' : 'Walk'} mode: all village lanes open`}
               </div>
             </div>
 
@@ -208,8 +281,30 @@ export default function NavigationPanel({
           </div>
 
           {!routeResult || !routeResult.reachable ? (
-            <div className="p-4 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl text-xs text-amber-900 dark:text-amber-200">
-              {routeResult?.reason || 'No connected village road reaches this house yet.'}
+            <div className="p-4 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl space-y-2.5 text-xs text-amber-900 dark:text-amber-200">
+              <div className="font-semibold">
+                {routeResult?.reason || 'No connected village road reaches this house yet.'}
+              </div>
+              {travelMode === 'car' && (
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => onChangeTravelMode('bike')}
+                    className="px-2.5 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <Bike className="w-3.5 h-3.5" />
+                    Try Bike
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChangeTravelMode('walk')}
+                    className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <Footprints className="w-3.5 h-3.5" />
+                    Try Walk
+                  </button>
+                </div>
+              )}
             </div>
           ) : (
             <>
@@ -221,7 +316,11 @@ export default function NavigationPanel({
                 return (
                 <div
                   className={`p-4 rounded-xl text-white space-y-2 ${
-                    isArrived ? 'bg-emerald-700' : 'bg-slate-900'
+                    isArrived
+                      ? routeResult.carPartialStop
+                        ? 'bg-orange-700'
+                        : 'bg-emerald-700'
+                      : 'bg-slate-900'
                   }`}
                 >
                   <div className="flex items-start gap-3">
@@ -234,7 +333,9 @@ export default function NavigationPanel({
                     <div className="min-w-0 flex-1">
                       <div className="text-xs font-mono tabular-nums text-emerald-300">
                         {isArrived
-                          ? 'Destination Reached'
+                          ? routeResult.carPartialStop
+                            ? 'Car Drop-Off Reached'
+                            : 'Destination Reached'
                           : distanceToNextTurnMeters != null
                           ? `In ${formatDistance(distanceToNextTurnMeters)}`
                           : formatDistance(activeInstruction.distanceMeters)}
@@ -257,9 +358,15 @@ export default function NavigationPanel({
                         : `Total: ${formatDistance(routeResult.totalDistanceMeters)}`}
                     </span>
                     <span>
-                      {liveProgress
-                        ? `${liveProgress.remainingWalkMinutes}m walk · ${liveProgress.remainingBikeMinutes}m bike`
-                        : `${routeResult.walkMinutes}m walk · ${routeResult.bikeMinutes}m bike`}
+                      {travelMode === 'car'
+                        ? `${remainingCarMinutes}m by car`
+                        : liveProgress
+                        ? travelMode === 'bike'
+                          ? `${liveProgress.remainingBikeMinutes}m by bike`
+                          : `${liveProgress.remainingWalkMinutes}m walk`
+                        : travelMode === 'bike'
+                        ? `${routeResult.bikeMinutes}m by bike`
+                        : `${routeResult.walkMinutes}m walk`}
                     </span>
                   </div>
 
@@ -281,13 +388,46 @@ export default function NavigationPanel({
                           : 'Following saved road'}
                       </span>
                       <span className="font-mono tabular-nums">
-                        Walked {formatDistance(liveProgress.coveredMeters)}
+                        Covered {formatDistance(liveProgress.coveredMeters)}
                       </span>
                     </div>
                   )}
                 </div>
                 );
               })()}
+
+              {/* Car Narrow-Lane Advisory when House sits inside a non-car lane */}
+              {travelMode === 'car' && routeResult.carPartialStop && (
+                <div className="p-3 bg-orange-50 dark:bg-orange-950/50 border border-orange-200 dark:border-orange-800 rounded-xl space-y-2">
+                  <div className="text-xs font-bold text-orange-900 dark:text-orange-200">
+                    Car stops {formatDistance(routeResult.lastMileWalkMeters ?? 0)} before House{' '}
+                    {targetHouse.houseNumber}
+                  </div>
+                  <p className="text-[11px] text-orange-800 dark:text-orange-300 leading-relaxed">
+                    The remaining stretch is a narrow lane where cars cannot enter. Park here and
+                    walk {formatDistance(routeResult.lastMileWalkMeters ?? 0)}, or switch to Bike /
+                    Walk for door-to-door lane navigation.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onChangeTravelMode('bike')}
+                      className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Bike className="w-3 h-3" />
+                      Switch to Bike
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onChangeTravelMode('walk')}
+                      className="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-800 border border-orange-300 dark:border-orange-700 text-orange-900 dark:text-orange-200 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Footprints className="w-3 h-3" />
+                      Switch to Walk
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Available Routes Comparison when multiple village road paths exist */}
               {routeOptions.length > 1 && (
@@ -312,8 +452,13 @@ export default function NavigationPanel({
                           <div className="flex items-center justify-between gap-2 text-xs font-semibold text-slate-900 dark:text-slate-100">
                             <span>{opt.routeLabel ?? `Route ${idx + 1}`}</span>
                             <span className="font-mono tabular-nums text-sky-800 dark:text-sky-400">
-                              {formatDistance(opt.totalDistanceMeters)} · {opt.walkMinutes}m walk /{' '}
-                              {opt.bikeMinutes}m bike
+                              {formatDistance(opt.totalDistanceMeters)} ·{' '}
+                              {formatModeEta(
+                                opt.totalDistanceMeters,
+                                opt.walkMinutes,
+                                opt.bikeMinutes,
+                                opt.carMinutes
+                              )}
                             </span>
                           </div>
                           {opt.viaSummary && (
@@ -328,10 +473,10 @@ export default function NavigationPanel({
                 </div>
               )}
 
-              {/* Demo Walk Controls */}
+              {/* Live GPS or Simulator Controls */}
               <div className="p-3 bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl space-y-2">
                 <div className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Follow Route (Live GPS or Desktop Test)
+                  Route Simulator (Preview Trip)
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <button
@@ -346,12 +491,12 @@ export default function NavigationPanel({
                     {isSimulatingNav ? (
                       <>
                         <Square className="w-3.5 h-3.5" />
-                        Pause Demo
+                        Pause Sim
                       </>
                     ) : (
                       <>
                         <Play className="w-3.5 h-3.5" />
-                        Auto-Follow
+                        Simulate Trip
                       </>
                     )}
                   </button>
@@ -425,8 +570,17 @@ export default function NavigationPanel({
 
           {sortedHouses.length === 0 ? (
             <div className="p-6 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl text-center text-xs text-slate-600 dark:text-slate-300">
-              No houses mapped yet. Click <strong>Start Walk</strong> to walk a road and add Left /
-              Right houses.
+              {readOnlyPublic ? (
+                <>
+                  No houses mapped in this area yet. Pick a saved area from the header or switch to{' '}
+                  <strong>Company</strong> mode to map roads &amp; houses.
+                </>
+              ) : (
+                <>
+                  No houses mapped yet. Use <strong>Add</strong> or <strong>AutoMapX</strong> to map
+                  a road and save Left / Right houses.
+                </>
+              )}
             </div>
           ) : (
             <div className="border border-slate-200 dark:border-slate-700 rounded-xl divide-y divide-slate-200 dark:divide-slate-800">

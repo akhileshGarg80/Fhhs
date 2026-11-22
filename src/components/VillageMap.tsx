@@ -2105,34 +2105,39 @@ export default function VillageMap({
         .addTo(group);
     }
 
-    // End route strictly on the road with a clear stop dot + dotted pointer beside it to the house
+    // End route strictly on the road (or Car drop-off point if narrow lane ahead) with dotted connector to house
     const routeEndPt = aheadPts[aheadPts.length - 1];
     if (routeEndPt) {
+      const isCarStop = Boolean(routeResult.carPartialStop);
       L.polyline(
         [
           [routeEndPt.lat, routeEndPt.lng],
           [targetHouse.lat, targetHouse.lng],
         ],
         {
-          color: '#dc2626',
-          weight: 2.5,
-          opacity: 0.9,
-          dashArray: '3 5',
+          color: isCarStop ? '#ea580c' : '#dc2626',
+          weight: isCarStop ? 3 : 2.5,
+          opacity: 0.92,
+          dashArray: isCarStop ? '5 5' : '3 5',
           lineCap: 'round',
         }
       ).addTo(group);
 
       L.circleMarker([routeEndPt.lat, routeEndPt.lng], {
-        radius: 6,
+        radius: isCarStop ? 8 : 6,
         color: '#ffffff',
         weight: 2.5,
-        fillColor: '#2563eb',
+        fillColor: isCarStop ? '#ea580c' : '#2563eb',
         fillOpacity: 1,
       })
         .bindTooltip(
-          `Stop here on road · House ${targetHouse.houseNumber}${
-            targetHouse.shopName ? ` (${targetHouse.shopName})` : ''
-          } (${targetHouse.side === 'left' ? 'Left' : 'Right'})`
+          isCarStop
+            ? `Car stops here · Walk ${formatDistance(
+                routeResult.lastMileWalkMeters ?? 0
+              )} to House ${targetHouse.houseNumber}`
+            : `Stop here on road · House ${targetHouse.houseNumber}${
+                targetHouse.shopName ? ` (${targetHouse.shopName})` : ''
+              } (${targetHouse.side === 'left' ? 'Left' : 'Right'})`
         )
         .addTo(group);
     }

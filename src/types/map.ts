@@ -94,13 +94,20 @@ export interface NavigationInstruction {
   anchorPoint: { lat: number; lng: number };
 }
 
+export type TravelMode = 'car' | 'bike' | 'walk';
+
 export interface VillageRouteResult {
   reachable: boolean;
+  travelMode?: TravelMode;
   routeLabel?: string;
   viaSummary?: string;
   totalDistanceMeters: number;
   walkMinutes: number;
   bikeMinutes: number;
+  carMinutes?: number;
+  carPartialStop?: boolean;
+  carStopPoint?: { lat: number; lng: number };
+  lastMileWalkMeters?: number;
   polyline: { lat: number; lng: number }[];
   instructions: NavigationInstruction[];
   reason?: string;

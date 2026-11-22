@@ -1,21 +1,26 @@
 import {
+  Bike,
   Bookmark,
   Car,
   ChevronDown,
   ChevronUp,
   Eye,
   EyeOff,
+  Footprints,
   Gauge,
   Loader2,
+  LocateFixed,
   Map as MapIcon,
   MapPin,
   Maximize2,
   Moon,
   Navigation,
+  Play,
   Plus,
   PlusCircle,
   Route,
   Search,
+  Square,
   Store,
   Sun,
   Trash2,
@@ -51,6 +56,7 @@ import type {
   LatLngPoint,
   RoadJunction,
   SavedSearchArea,
+  TravelMode,
   VehicleSegmentAccess,
   VillageHouse,
   VillageRoad,
@@ -105,6 +111,8 @@ import {
   saveSavedAreas,
 } from './utils/storage.ts';
 
+type UserAccessRole = 'public' | 'company';
+
 type WorkspaceMode =
   | 'navigate'
   | 'add'
@@ -117,7 +125,9 @@ type WorkspaceMode =
 const DRAFT_WALK_KEY = 'grampath_walk_draft_v2';
 
 export default function App() {
+  const [accessRole, setAccessRole] = useState<UserAccessRole>('public');
   const [mode, setMode] = useState<WorkspaceMode>('navigate');
+  const [travelMode, setTravelMode] = useState<TravelMode>('walk');
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
       return localStorage.getItem('grampath_theme') === 'dark' ? 'dark' : 'light';
@@ -997,11 +1007,11 @@ export default function App() {
       });
   }, [houses, houseQuery]);
 
-  // Compute all distinct saved-road routes from navOrigin to target House
+  // Compute all distinct saved-road routes from navOrigin to target House for active travelMode
   const navRouteOptions = useMemo(() => {
     if (!targetHouse) return [];
-    return findRoutesToHouse(roads, navOrigin, targetHouse, 8);
-  }, [targetHouse, roads, navOrigin]);
+    return findRoutesToHouse(roads, navOrigin, targetHouse, 8, travelMode);
+  }, [targetHouse, roads, navOrigin, travelMode]);
 
   const safeSelectedRouteIndex =
     navRouteOptions.length > 0 ? Math.min(selectedRouteIndex, navRouteOptions.length - 1) : 0;
@@ -1164,9 +1174,52 @@ export default function App() {
     }
   }, [navRouteResult, targetHouse, showToast]);
 
+  const handleToggleNavSim = useCallback(() => {
+    if (isSimulatingNav) {
+      setIsSimulatingNav(false);
+      return;
+    }
+    if (!navRouteResult?.reachable || navRouteResult.polyline.length < 2) return;
+    setIsLiveGps(false);
+    autoFollowGpsRef.current = true;
+    setIsFollowingGps(true);
+    const poly = navRouteResult.polyline;
+    if (simIdxRef.current >= poly.length - 1) {
+      simIdxRef.current = 0;
+      const startPt = poly[0];
+      setCurrentNavStepIdx(0);
+      setUserLocation({
+        lat: startPt.lat,
+        lng: startPt.lng,
+        accuracy: 1.5,
+        timestamp: Date.now(),
+      });
+      setFocusTarget({ lat: startPt.lat, lng: startPt.lng, key: Date.now() });
+    }
+    setIsSimulatingNav(true);
+  }, [isSimulatingNav, navRouteResult]);
+
+  const handleChangeTravelMode = useCallback((next: TravelMode) => {
+    setTravelMode(next);
+    setSelectedRouteIndex(0);
+    setCurrentNavStepIdx(0);
+    simIdxRef.current = 0;
+    setIsSimulatingNav(false);
+  }, []);
+
+  const handleChangeAccessRole = useCallback((nextRole: UserAccessRole) => {
+    setAccessRole(nextRole);
+    if (nextRole === 'public') {
+      setMode('navigate');
+      setMapCleanScreen(false);
+      setEditorEnabled(false);
+      setIsPickingSpot(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!isSimulatingNav || !targetHouse) return;
-    const t = setInterval(stepNavSimulation, 1400);
+    const t = setInterval(stepNavSimulation, 1000);
     return () => clearInterval(t);
   }, [isSimulatingNav, targetHouse, stepNavSimulation]);
 
@@ -1283,7 +1336,7 @@ export default function App() {
         handleLocateMe(false);
       }
 
-      const initialRoutes = findRoutesToHouse(roads, userLocation, house, 8);
+      const initialRoutes = findRoutesToHouse(roads, userLocation, house, 8, travelMode);
       const bestRoute = initialRoutes[0];
       const targetRoad = roads.find((r) => r.id === house.roadId);
       const distToHouse = haversineMeters(userLocation, house);
@@ -1320,13 +1373,13 @@ export default function App() {
         });
       }
     },
-    [roads, userLocation, handleLocateMe]
+    [roads, userLocation, travelMode, handleLocateMe]
   );
 
   const handleStartPreviewRouteNavigation = useCallback(
     (fromHouse: VillageHouse, toHouse: VillageHouse, routeIndex: number) => {
       const originPt = { lat: fromHouse.roadLat, lng: fromHouse.roadLng };
-      const routes = findRoutesToHouse(roads, originPt, toHouse, 8);
+      const routes = findRoutesToHouse(roads, originPt, toHouse, 8, travelMode);
       const safeIdx = routes.length > 0 ? Math.min(routeIndex, routes.length - 1) : 0;
       const chosen = routes[safeIdx] ?? routes[0];
 
@@ -1372,7 +1425,7 @@ export default function App() {
         }`
       );
     },
-    [roads, showToast]
+    [roads, travelMode, showToast]
   );
 
   const handleExitNavigation = useCallback(() => {
@@ -4664,80 +4717,114 @@ export default function App() {
               )}
             </div>
 
-            {/* Top Header Buttons: Roads-Only Clean Map + Vehicles Simulator */}
-            <button
-              type="button"
-              onClick={() => {
-                setMapCleanScreen(false);
-                if (mode === 'map') {
-                  setMode('navigate');
-                } else {
-                  setMode('map');
-                  setTargetHouse(null);
-                  setTimeout(() => handleFitAllRoadsOnly(), 60);
-                }
-              }}
-              title="Full-page Roads Only Map (no houses — great for YouTube & visualization)"
-              className={`h-7 px-2 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
-                mode === 'map'
-                  ? 'bg-blue-700 border-blue-800 text-white shadow-xs'
-                  : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-blue-50 dark:hover:bg-blue-950/50'
-              }`}
-            >
-              <MapIcon className="w-3.5 h-3.5 shrink-0" />
-              <span>Map</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setMapCleanScreen(false);
-                if (mode === 'vehicles') {
-                  setMode('navigate');
-                } else {
-                  setMode('vehicles');
-                  setTargetHouse(null);
-                  setTimeout(() => handleFitAllRoadsOnly(), 60);
-                }
-              }}
-              title="Vehicles Mode: Slow village tour with CAR ON / CAR OFF & automatic Main Road detection"
-              className={`h-7 px-2 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
-                mode === 'vehicles'
-                  ? 'bg-emerald-700 border-emerald-800 text-white shadow-xs'
-                  : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-emerald-50 dark:hover:bg-emerald-950/50'
-              }`}
-            >
-              <Car className="w-3.5 h-3.5 shrink-0" />
-              <span>Vehicles</span>
-            </button>
-
-            {amxIsRunning && mode !== 'automapx' && (
-              <button
-                type="button"
-                onClick={() => setMode('automapx')}
-                className="hidden sm:inline-flex px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-950/70 text-violet-800 dark:text-violet-300 text-[10px] font-semibold items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <span
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    amxIsPaused ? 'bg-amber-500' : 'bg-violet-600 animate-pulse'
+            {/* Company-Only Top Header Tools: Roads-Only Clean Map + Vehicles Simulator */}
+            {accessRole === 'company' && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMapCleanScreen(false);
+                    if (mode === 'map') {
+                      setMode('navigate');
+                    } else {
+                      setMode('map');
+                      setTargetHouse(null);
+                      setTimeout(() => handleFitAllRoadsOnly(), 60);
+                    }
+                  }}
+                  title="Full-page Roads Only Map (no houses — great for YouTube & visualization)"
+                  className={`h-7 px-1.5 sm:px-2 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
+                    mode === 'map'
+                      ? 'bg-blue-700 border-blue-800 text-white shadow-xs'
+                      : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-blue-50 dark:hover:bg-blue-950/50'
                   }`}
-                />
-                <span>AutoMapX</span>
-              </button>
-            )}
-            {isAutoRecording && mode !== 'auto' && (
-              <button
-                type="button"
-                onClick={() => setMode('auto')}
-                className="hidden sm:inline-flex px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-semibold items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                <span>Auto Live</span>
-              </button>
+                >
+                  <MapIcon className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden xs:inline sm:inline">Map</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMapCleanScreen(false);
+                    if (mode === 'vehicles') {
+                      setMode('navigate');
+                    } else {
+                      setMode('vehicles');
+                      setTargetHouse(null);
+                      setTimeout(() => handleFitAllRoadsOnly(), 60);
+                    }
+                  }}
+                  title="Vehicles Mode: Mark Car-accessible corridors & Main Road detection"
+                  className={`h-7 px-1.5 sm:px-2 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
+                    mode === 'vehicles'
+                      ? 'bg-emerald-700 border-emerald-800 text-white shadow-xs'
+                      : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-emerald-50 dark:hover:bg-emerald-950/50'
+                  }`}
+                >
+                  <Car className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden sm:inline">Vehicles</span>
+                </button>
+
+                {amxIsRunning && mode !== 'automapx' && (
+                  <button
+                    type="button"
+                    onClick={() => setMode('automapx')}
+                    className="hidden sm:inline-flex px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-950/70 text-violet-800 dark:text-violet-300 text-[10px] font-semibold items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        amxIsPaused ? 'bg-amber-500' : 'bg-violet-600 animate-pulse'
+                      }`}
+                    />
+                    <span>AutoMapX</span>
+                  </button>
+                )}
+                {isAutoRecording && mode !== 'auto' && (
+                  <button
+                    type="button"
+                    onClick={() => setMode('auto')}
+                    className="hidden sm:inline-flex px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-semibold items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                    <span>Auto Live</span>
+                  </button>
+                )}
+              </>
             )}
           </div>
 
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+            {/* Public | Company Access Role Toggle (Default: Public) */}
+            <div
+              role="group"
+              aria-label="Access Role"
+              className="inline-flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0"
+            >
+              <button
+                type="button"
+                onClick={() => handleChangeAccessRole('public')}
+                className={`px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-bold transition-colors cursor-pointer ${
+                  accessRole === 'public'
+                    ? 'bg-emerald-700 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                Public
+              </button>
+              <button
+                type="button"
+                onClick={() => handleChangeAccessRole('company')}
+                className={`px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-bold transition-colors cursor-pointer ${
+                  accessRole === 'company'
+                    ? 'bg-slate-900 dark:bg-sky-700 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                Company
+              </button>
+            </div>
+
             <button
               type="button"
               onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
@@ -5153,6 +5240,9 @@ export default function App() {
                   });
                 }}
                 onTogglePickSpot={() => setIsPickingSpot((v) => !v)}
+                travelMode={travelMode}
+                onChangeTravelMode={handleChangeTravelMode}
+                readOnlyPublic={accessRole === 'public'}
                 targetHouse={targetHouse}
                 routeResult={navRouteResult}
                 routeOptions={navRouteOptions}
@@ -5172,7 +5262,7 @@ export default function App() {
                 onSelectHouseToNavigate={startNavigateToHouse}
                 onExitNavigation={handleExitNavigation}
                 onStepNavSim={stepNavSimulation}
-                onToggleAutoSim={() => setIsSimulatingNav((v) => !v)}
+                onToggleAutoSim={handleToggleNavSim}
                 onFocusPoint={(lat, lng, zoom) =>
                   setFocusTarget({ lat, lng, zoom, key: Date.now() })
                 }
@@ -5328,27 +5418,186 @@ export default function App() {
 
               {mapElement}
 
+              {/* Desktop Floating Quick Travel Mode + Simulator Bar when House is active */}
+              {targetHouse && (
+                <div className="hidden lg:flex items-center gap-2 absolute bottom-4 left-1/2 -translate-x-1/2 z-[485] px-3 py-2 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-slate-200 dark:border-slate-700 shadow-xl">
+                  <div className="flex items-center gap-1 p-0.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                    {(
+                      [
+                        { id: 'car', label: 'Car', Icon: Car },
+                        { id: 'bike', label: 'Bike', Icon: Bike },
+                        { id: 'walk', label: 'Walk', Icon: Footprints },
+                      ] as const
+                    ).map(({ id, label, Icon }) => {
+                      const active = travelMode === id;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => handleChangeTravelMode(id)}
+                          className={`px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors ${
+                            active
+                              ? id === 'car'
+                                ? 'bg-blue-700 text-white'
+                                : 'bg-emerald-700 text-white'
+                              : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                          }`}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                          <span>{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {navRouteResult?.reachable && (
+                    <>
+                      <div className="text-xs font-mono tabular-nums font-bold text-slate-800 dark:text-slate-200 px-1.5 whitespace-nowrap">
+                        {formatDistance(
+                          liveProgress ? liveProgress.remainingMeters : navRouteResult.totalDistanceMeters
+                        )}
+                        {navRouteResult.carPartialStop && travelMode === 'car' && (
+                          <span className="ml-1.5 text-orange-600 dark:text-orange-400">
+                            · Car stop ({formatDistance(navRouteResult.lastMileWalkMeters ?? 0)} walk left)
+                          </span>
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleToggleNavSim}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                          isSimulatingNav
+                            ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                            : 'bg-emerald-700 hover:bg-emerald-800 text-white'
+                        }`}
+                      >
+                        {isSimulatingNav ? (
+                          <>
+                            <Square className="w-3.5 h-3.5" />
+                            <span>Pause Sim</span>
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-3.5 h-3.5" />
+                            <span>Simulate</span>
+                          </>
+                        )}
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+
               {/* Mobile Compact Bottom Sheet for Navigate */}
               <div className="lg:hidden absolute bottom-0 inset-x-0 z-[500]">
                 <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 rounded-t-2xl shadow-lg">
                   <button
                     type="button"
                     onClick={() => setMobileSheetOpen((v) => !v)}
-                    className="w-full px-4 py-3 flex items-center justify-between text-xs font-semibold text-slate-900 dark:text-slate-100 cursor-pointer"
+                    className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-slate-900 dark:text-slate-100 cursor-pointer"
                   >
                     <span className="truncate pr-2">
                       {targetHouse
-                        ? `Tracking House ${targetHouse.houseNumber}${
+                        ? `House ${targetHouse.houseNumber}${
                             targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
-                          } (${targetHouse.side === 'left' ? 'Left' : 'Right'})`
+                          }${
+                            navRouteResult?.reachable
+                              ? ` · ${formatDistance(
+                                  liveProgress
+                                    ? liveProgress.remainingMeters
+                                    : navRouteResult.totalDistanceMeters
+                                )}`
+                              : ''
+                          }`
                         : `Select a House or Shop (${houses.length}) to Track`}
                     </span>
                     {mobileSheetOpen ? (
-                      <ChevronDown className="w-4 h-4 text-slate-500 dark:text-slate-400" />
+                      <ChevronDown className="w-4 h-4 text-slate-500 dark:text-slate-400 shrink-0" />
                     ) : (
-                      <ChevronUp className="w-4 h-4 text-slate-500 dark:text-slate-400" />
+                      <ChevronUp className="w-4 h-4 text-slate-500 dark:text-slate-400 shrink-0" />
                     )}
                   </button>
+
+                  {/* Always-visible compact Travel Mode + Simulator + Live GPS bar on mobile */}
+                  {!mobileSheetOpen && (
+                    <div className="px-3 pb-2.5 flex items-center justify-between gap-1.5 border-t border-slate-100 dark:border-slate-800/80 pt-2">
+                      <div className="grid grid-cols-3 gap-0.5 p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0">
+                        {(
+                          [
+                            { id: 'car', label: 'Car', Icon: Car },
+                            { id: 'bike', label: 'Bike', Icon: Bike },
+                            { id: 'walk', label: 'Walk', Icon: Footprints },
+                          ] as const
+                        ).map(({ id, label, Icon }) => {
+                          const active = travelMode === id;
+                          return (
+                            <button
+                              key={id}
+                              type="button"
+                              onClick={() => handleChangeTravelMode(id)}
+                              className={`px-2 py-1 rounded-md text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer transition-colors ${
+                                active
+                                  ? id === 'car'
+                                    ? 'bg-blue-700 text-white'
+                                    : 'bg-emerald-700 text-white'
+                                  : 'text-slate-600 dark:text-slate-300'
+                              }`}
+                            >
+                              <Icon className="w-3 h-3" />
+                              <span>{label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsLiveGps((prev) => {
+                              const next = !prev;
+                              if (next) handleLocateMe();
+                              return next;
+                            });
+                          }}
+                          title="Toggle Live GPS"
+                          className={`px-2 py-1.5 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer ${
+                            isLiveGps
+                              ? 'bg-sky-700 border-sky-700 text-white'
+                              : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                          }`}
+                        >
+                          <LocateFixed className="w-3.5 h-3.5" />
+                          <span className="hidden xs:inline">GPS</span>
+                        </button>
+
+                        {targetHouse && navRouteResult?.reachable && (
+                          <button
+                            type="button"
+                            onClick={handleToggleNavSim}
+                            className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer ${
+                              isSimulatingNav
+                                ? 'bg-amber-600 text-white'
+                                : 'bg-emerald-700 text-white'
+                            }`}
+                          >
+                            {isSimulatingNav ? (
+                              <>
+                                <Square className="w-3 h-3" />
+                                <span>Pause</span>
+                              </>
+                            ) : (
+                              <>
+                                <Play className="w-3 h-3" />
+                                <span>Simulate</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   {mobileSheetOpen && (
                     <div className="max-h-[58vh] overflow-y-auto border-t border-slate-100 dark:border-slate-800">
@@ -5368,6 +5617,9 @@ export default function App() {
                           setIsPickingSpot((v) => !v);
                           setMobileSheetOpen(false);
                         }}
+                        travelMode={travelMode}
+                        onChangeTravelMode={handleChangeTravelMode}
+                        readOnlyPublic={accessRole === 'public'}
                         targetHouse={targetHouse}
                         routeResult={navRouteResult}
                         routeOptions={navRouteOptions}
@@ -5390,7 +5642,7 @@ export default function App() {
                         }}
                         onExitNavigation={handleExitNavigation}
                         onStepNavSim={stepNavSimulation}
-                        onToggleAutoSim={() => setIsSimulatingNav((v) => !v)}
+                        onToggleAutoSim={handleToggleNavSim}
                         onFocusPoint={(lat, lng, zoom) => {
                           setFocusTarget({ lat, lng, zoom, key: Date.now() });
                           setMobileSheetOpen(false);
@@ -5405,8 +5657,8 @@ export default function App() {
         )}
       </main>
 
-      {/* Persistent Lifted Thumb-Zone Bottom Navigation Bar (hidden only in pure Clean Screen recording mode) */}
-      {!isPureRecordingScreen && (
+      {/* Persistent Lifted Thumb-Zone Bottom Navigation Bar (Company mode only, hidden in Clean Screen & Public mode) */}
+      {accessRole === 'company' && !isPureRecordingScreen && (
       <nav
         aria-label="Primary Workspace Navigation"
         className="shrink-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-1 sm:px-6 pt-1.5 pb-[max(1.1rem,env(safe-area-inset-bottom))] sm:py-1.5 grid grid-cols-5 items-center z-[530] shadow-[0_-4px_16px_rgba(15,23,42,0.08)] dark:shadow-[0_-4px_16px_rgba(0,0,0,0.35)]"

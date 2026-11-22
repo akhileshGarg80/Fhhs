@@ -5,6 +5,7 @@ import type {
   NavigationInstruction,
   RoadHierarchyRole,
   RoadJunction,
+  TravelMode,
   TurnDirection,
   VehicleSegmentAccess,
   VillageHouse,
@@ -877,38 +878,150 @@ function buildRouteResultFromPath(
 
   return {
     reachable: true,
+    travelMode: 'walk',
     routeLabel: routeIndex === 0 ? 'Shortest (Closest)' : `Route ${routeIndex + 1}`,
     viaSummary,
     totalDistanceMeters,
     walkMinutes: Math.max(1, Math.round(totalDistanceMeters / 75)),
     bikeMinutes: Math.max(1, Math.round(totalDistanceMeters / 230)),
+    carMinutes: Math.max(1, Math.round(totalDistanceMeters / 420)),
     polyline: fullPolyline,
     instructions,
   };
 }
 
+function extractCarAccessibleRoads(roads: VillageRoad[]): VillageRoad[] {
+  const carRoads: VillageRoad[] = [];
+
+  for (const road of roads) {
+    if (road.points.length < 2) continue;
+    const segCount = road.points.length - 1;
+    const access = road.segmentAccess;
+    if (!access || access.length !== segCount) continue;
+
+    let i = 0;
+    while (i < segCount) {
+      if (access[i] !== 'car') {
+        i++;
+        continue;
+      }
+      const startIdx = i;
+      while (i + 1 < segCount && access[i + 1] === 'car') {
+        i++;
+      }
+      const endIdx = i;
+      const slicePts = road.points.slice(startIdx, endIdx + 2);
+      if (slicePts.length >= 2) {
+        carRoads.push({
+          ...road,
+          id: `${road.id}__car_${startIdx}`,
+          points: slicePts,
+          distanceMeters: computePathDistance(slicePts),
+        });
+      }
+      i++;
+    }
+  }
+
+  return carRoads;
+}
+
 /**
- * Finds all distinct road-following routes (up to maxRoutes) between start and targetHouse,
- * surfacing the shortest route first along with every alternative path through the network.
+ * Finds all distinct road-following routes (up to maxRoutes) between start and targetHouse.
+ * For `walk` and `bike` (identical all-road network), routes all the way to the house.
+ * For `car`, strictly uses company-saved `car` segments and stops at the furthest car-reachable
+ * point if the destination sits inside a narrow no-car lane.
  */
 export function findRoutesToHouse(
   roads: VillageRoad[],
   start: { lat: number; lng: number },
   targetHouse: VillageHouse,
-  maxRoutes = 8
+  maxRoutes = 8,
+  travelMode: TravelMode = 'walk'
 ): VillageRouteResult[] {
   if (roads.length === 0) {
     return [
       {
         reachable: false,
+        travelMode,
         totalDistanceMeters: 0,
         walkMinutes: 0,
         bikeMinutes: 0,
+        carMinutes: 0,
         polyline: [],
         instructions: [],
-        reason: 'No village roads recorded yet. Walk a road first.',
+        reason: 'No village roads recorded yet.',
       },
     ];
+  }
+
+  if (travelMode === 'car') {
+    const carRoads = extractCarAccessibleRoads(roads);
+    if (carRoads.length === 0) {
+      const anySurveyed = roads.some((r) => (r.segmentAccess?.length ?? 0) > 0);
+      return [
+        {
+          reachable: false,
+          travelMode: 'car',
+          totalDistanceMeters: 0,
+          walkMinutes: 0,
+          bikeMinutes: 0,
+          carMinutes: 0,
+          polyline: [],
+          instructions: [],
+          reason: anySurveyed
+            ? 'No Car-accessible roads reach this area. Switch to Bike or Walk.'
+            : 'Car road data is not marked yet (Company → Vehicles). Switch to Bike or Walk.',
+        },
+      ];
+    }
+
+    const carRoutes = findRoutesToHouse(carRoads, start, targetHouse, maxRoutes, 'walk');
+    const targetRoadAnchor = { lat: targetHouse.roadLat, lng: targetHouse.roadLng };
+
+    return carRoutes.map((route) => {
+      if (!route.reachable || route.polyline.length === 0) {
+        return { ...route, travelMode: 'car' };
+      }
+
+      const carEnd = route.polyline[route.polyline.length - 1];
+      const gapToHouseRoad = haversineMeters(carEnd, targetRoadAnchor);
+      const isPartial = gapToHouseRoad > 12;
+
+      if (!isPartial) {
+        return {
+          ...route,
+          travelMode: 'car',
+          carPartialStop: false,
+        };
+      }
+
+      const walkTail = findRoutesToHouse(roads, carEnd, targetHouse, 1, 'walk')[0];
+      const lastMileWalkMeters =
+        walkTail && walkTail.reachable ? walkTail.totalDistanceMeters : Math.round(gapToHouseRoad);
+
+      const updatedInstructions = route.instructions.map((inst, idx) => {
+        if (idx === route.instructions.length - 1 && inst.turnType === 'arrive') {
+          const shopSuffix = targetHouse.shopName ? ` · ${targetHouse.shopName}` : '';
+          return {
+            ...inst,
+            instruction: `Car stops here · Walk ${formatDistance(lastMileWalkMeters)} to House ${
+              targetHouse.houseNumber
+            }${shopSuffix}`,
+          };
+        }
+        return inst;
+      });
+
+      return {
+        ...route,
+        travelMode: 'car',
+        carPartialStop: true,
+        carStopPoint: carEnd,
+        lastMileWalkMeters,
+        instructions: updatedInstructions,
+      };
+    });
   }
 
   const graph = buildRoadNetworkGraph(roads, start, targetHouse);
@@ -1022,8 +1135,8 @@ export function findRoutesToHouse(
 
   foundPaths.sort((a, b) => a.trueDistMeters - b.trueDistMeters);
 
-  return foundPaths.slice(0, maxRoutes).map((p, idx) =>
-    buildRouteResultFromPath(
+    return foundPaths.slice(0, maxRoutes).map((p, idx) => ({
+    ...buildRouteResultFromPath(
       graph.nodes,
       p.nodeSeq,
       p.edgeSeq,
@@ -1032,16 +1145,18 @@ export function findRoutesToHouse(
       start,
       targetHouse,
       idx
-    )
-  );
+    ),
+    travelMode,
+  }));
 }
 
 export function findRouteToHouse(
   roads: VillageRoad[],
   start: { lat: number; lng: number },
-  targetHouse: VillageHouse
+  targetHouse: VillageHouse,
+  travelMode: TravelMode = 'walk'
 ): VillageRouteResult {
-  return findRoutesToHouse(roads, start, targetHouse, 1)[0];
+  return findRoutesToHouse(roads, start, targetHouse, 1, travelMode)[0];
 }
 
 export interface LiveRouteProgress {
