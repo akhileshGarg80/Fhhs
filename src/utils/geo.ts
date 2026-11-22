@@ -220,7 +220,7 @@ export function getNextSequentialHouseNumber(
 
 // --- Planar Segment Projection & Intersection Helpers ---
 
-function projectPointOnSegment(
+export function projectPointOnSegment(
   p: { lat: number; lng: number },
   a: { lat: number; lng: number },
   b: { lat: number; lng: number }
@@ -313,6 +313,7 @@ function buildRoadNetworkGraph(
   startNode: number;
   endNode: number;
   startApproachMeters: number;
+  endApproachMeters: number;
 } | null {
   const validRoads = roads.filter((r) => r.points.length >= 2);
   if (validRoads.length === 0) return null;
@@ -482,6 +483,7 @@ function buildRoadNetworkGraph(
     ri: 0,
     si: 0,
     dist: Infinity,
+    rawDist: Infinity,
     t: 0,
     pt: validRoads[0].points[0] as { lat: number; lng: number },
   };
@@ -493,7 +495,14 @@ function buildRoadNetworkGraph(
       const effectiveDist =
         r.id === targetHouse.roadId ? proj.distMeters * 0.5 : proj.distMeters;
       if (effectiveDist < endBest.dist) {
-        endBest = { ri, si, dist: effectiveDist, t: proj.t, pt: proj.point };
+        endBest = {
+          ri,
+          si,
+          dist: effectiveDist,
+          rawDist: proj.distMeters,
+          t: proj.t,
+          pt: proj.point,
+        };
       }
     }
   }
@@ -566,6 +575,7 @@ function buildRoadNetworkGraph(
     startNode,
     endNode,
     startApproachMeters: startBest.dist,
+    endApproachMeters: endBest.rawDist,
   };
 }
 
@@ -675,6 +685,7 @@ function buildRouteResultFromPath(
   edgeSeq: GraphEdge[],
   trueDistMeters: number,
   startApproachMeters: number,
+  endApproachMeters: number,
   userStart: { lat: number; lng: number },
   targetHouse: VillageHouse,
   routeIndex: number
@@ -885,12 +896,13 @@ function buildRouteResultFromPath(
     walkMinutes: Math.max(1, Math.round(totalDistanceMeters / 75)),
     bikeMinutes: Math.max(1, Math.round(totalDistanceMeters / 230)),
     carMinutes: Math.max(1, Math.round(totalDistanceMeters / 420)),
+    localGapMeters: Math.round(Math.max(startApproachMeters, endApproachMeters)),
     polyline: fullPolyline,
     instructions,
   };
 }
 
-function extractCarAccessibleRoads(roads: VillageRoad[]): VillageRoad[] {
+export function extractCarAccessibleRoads(roads: VillageRoad[]): VillageRoad[] {
   const carRoads: VillageRoad[] = [];
 
   for (const road of roads) {
@@ -1150,13 +1162,14 @@ export function findRoutesToHouse(
 
   foundPaths.sort((a, b) => a.trueDistMeters - b.trueDistMeters);
 
-    return foundPaths.slice(0, maxRoutes).map((p, idx) => ({
+  return foundPaths.slice(0, maxRoutes).map((p, idx) => ({
     ...buildRouteResultFromPath(
       graph.nodes,
       p.nodeSeq,
       p.edgeSeq,
       p.trueDistMeters,
       graph.startApproachMeters,
+      graph.endApproachMeters,
       start,
       targetHouse,
       idx

@@ -44,11 +44,44 @@
   }
 }
 
-/* Leaflet map container overrides for crisp cartographic controls */
+/* Leaflet map container overrides for ultra-smooth 60fps GPU-composited panning, zooming & rotation */
 .leaflet-container {
   font-family: var(--font-sans);
   background: #e2e8f0;
   outline: none;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  transform: translateZ(0);
+}
+
+.leaflet-map-pane,
+.leaflet-tile-pane,
+.leaflet-overlay-pane,
+.leaflet-marker-pane {
+  will-change: transform;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.leaflet-tile {
+  will-change: transform, opacity;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.leaflet-fade-anim .leaflet-tile {
+  transition: opacity 0.14s linear;
+}
+
+.leaflet-zoom-anim .leaflet-zoom-animated {
+  transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+button,
+a,
+[role="button"] {
+  touch-action: manipulation;
 }
 
 html.dark .leaflet-container {

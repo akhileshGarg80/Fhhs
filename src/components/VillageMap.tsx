@@ -1,7 +1,7 @@
 import L from '../utils/leafletInit.ts';
 import 'leaflet-rotate';
 import { Compass, Crosshair, RotateCcw, RotateCw } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type {
   AutoMapXNode,
   LatLngPoint,
@@ -221,7 +221,87 @@ const TILE_LAYERS: Record<
 
 const BASE_LAYER_STORAGE_KEY = 'grampath_base_layer';
 
-export default function VillageMap({
+interface CursorGlideState {
+  lat: number;
+  lng: number;
+  bearing: number;
+  rafId: number | null;
+}
+
+function shortestAngleDiff(fromDeg: number, toDeg: number): number {
+  return ((toDeg - fromDeg + 540) % 360) - 180;
+}
+
+function animateCursorGlide(
+  stateRef: { current: CursorGlideState | null },
+  targetLat: number,
+  targetLng: number,
+  targetBearing: number,
+  durationMs: number,
+  onStep: (lat: number, lng: number, bearing: number) => void
+) {
+  if (stateRef.current?.rafId != null) {
+    cancelAnimationFrame(stateRef.current.rafId);
+    stateRef.current.rafId = null;
+  }
+
+  const prev = stateRef.current;
+  if (!prev || haversineMeters({ lat: prev.lat, lng: prev.lng }, { lat: targetLat, lng: targetLng }) > 4000) {
+    stateRef.current = { lat: targetLat, lng: targetLng, bearing: targetBearing, rafId: null };
+    onStep(targetLat, targetLng, targetBearing);
+    return;
+  }
+
+  const fromLat = prev.lat;
+  const fromLng = prev.lng;
+  const fromBearing = prev.bearing;
+  const bearingDelta = shortestAngleDiff(fromBearing, targetBearing);
+
+  if (
+    Math.abs(targetLat - fromLat) < 1e-7 &&
+    Math.abs(targetLng - fromLng) < 1e-7 &&
+    Math.abs(bearingDelta) < 0.2
+  ) {
+    stateRef.current = { lat: targetLat, lng: targetLng, bearing: targetBearing, rafId: null };
+    onStep(targetLat, targetLng, targetBearing);
+    return;
+  }
+
+  const startTime = performance.now();
+  const nextState: CursorGlideState = {
+    lat: fromLat,
+    lng: fromLng,
+    bearing: fromBearing,
+    rafId: null,
+  };
+  stateRef.current = nextState;
+
+  const step = (now: number) => {
+    const rawT = durationMs <= 0 ? 1 : Math.min(1, (now - startTime) / durationMs);
+    const ease = 1 - Math.pow(1 - rawT, 3);
+    const curLat = fromLat + (targetLat - fromLat) * ease;
+    const curLng = fromLng + (targetLng - fromLng) * ease;
+    const curBearing = (fromBearing + bearingDelta * ease + 360) % 360;
+
+    nextState.lat = curLat;
+    nextState.lng = curLng;
+    nextState.bearing = curBearing;
+    onStep(curLat, curLng, curBearing);
+
+    if (rawT < 1) {
+      nextState.rafId = requestAnimationFrame(step);
+    } else {
+      nextState.rafId = null;
+      nextState.lat = targetLat;
+      nextState.lng = targetLng;
+      nextState.bearing = targetBearing;
+    }
+  };
+
+  nextState.rafId = requestAnimationFrame(step);
+}
+
+function VillageMap({
   roads,
   houses,
   draftHouses,
@@ -276,10 +356,26 @@ export default function VillageMap({
   const autoMapXLayerRef = useRef<L.LayerGroup | null>(null);
   const roadEditorLayerRef = useRef<L.LayerGroup | null>(null);
   const editorTransientLayerRef = useRef<L.LayerGroup | null>(null);
-  const routeLayerRef = useRef<L.LayerGroup | null>(null);
+  const routeStaticLayerRef = useRef<L.LayerGroup | null>(null);
+  const routeDynamicLayerRef = useRef<L.LayerGroup | null>(null);
+  const routeDoneLineRef = useRef<L.Polyline | null>(null);
+  const routeAheadCasingRef = useRef<L.Polyline | null>(null);
+  const routeAheadLineRef = useRef<L.Polyline | null>(null);
   const gpsLayerRef = useRef<L.LayerGroup | null>(null);
+  const gpsCircleRef = useRef<L.Circle | null>(null);
+  const gpsMarkerRef = useRef<L.Marker | L.CircleMarker | null>(null);
+  const gpsMarkerIsArrowRef = useRef<boolean | null>(null);
+  const gpsGlideRef = useRef<CursorGlideState | null>(null);
   const vehicleSimLayerRef = useRef<L.LayerGroup | null>(null);
+  const vehMarkerRef = useRef<L.Marker | null>(null);
+  const vehMarkerCarOnRef = useRef<boolean | null>(null);
+  const vehGlideRef = useRef<CursorGlideState | null>(null);
   const simulationLayerRef = useRef<L.LayerGroup | null>(null);
+  const simGuideLineRef = useRef<L.Polyline | null>(null);
+  const simLeftDotRef = useRef<L.CircleMarker | null>(null);
+  const simRightDotRef = useRef<L.CircleMarker | null>(null);
+  const simMarkerRef = useRef<L.Marker | null>(null);
+  const simGlideRef = useRef<CursorGlideState | null>(null);
   const vehicleOverlayRef = useRef(vehicleOverlay);
   vehicleOverlayRef.current = vehicleOverlay;
 
@@ -329,11 +425,27 @@ export default function VillageMap({
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
+    const canvasRenderer = L.canvas({ padding: 0.85, tolerance: 8 });
+
     const map = L.map(containerRef.current, {
       center: [initialViewRef.current.lat, initialViewRef.current.lng],
       zoom: initialViewRef.current.zoom,
       maxZoom: 20,
       zoomControl: false,
+      preferCanvas: true,
+      renderer: canvasRenderer,
+      zoomSnap: 0.25,
+      zoomDelta: 0.5,
+      wheelPxPerZoomLevel: 80,
+      wheelDebounceTime: 25,
+      inertia: true,
+      inertiaDeceleration: 2400,
+      inertiaMaxSpeed: 1800,
+      easeLinearity: 0.16,
+      zoomAnimation: true,
+      fadeAnimation: true,
+      markerZoomAnimation: true,
+      bounceAtZoomLimits: false,
       rotate: true,
       bearing: initialViewRef.current.bearing ?? 0,
       touchRotate: true,
@@ -345,7 +457,8 @@ export default function VillageMap({
     L.control.scale({ position: 'bottomleft', imperial: false }).addTo(map);
 
     roadsLayerRef.current = L.layerGroup().addTo(map);
-    routeLayerRef.current = L.layerGroup().addTo(map);
+    routeStaticLayerRef.current = L.layerGroup().addTo(map);
+    routeDynamicLayerRef.current = L.layerGroup().addTo(map);
     walkLayerRef.current = L.layerGroup().addTo(map);
     autoTripLayerRef.current = L.layerGroup().addTo(map);
     autoMapXLayerRef.current = L.layerGroup().addTo(map);
@@ -376,42 +489,70 @@ export default function VillageMap({
       }
     });
 
+    let rotateRafId: number | null = null;
     map.on('rotate', () => {
-      const b = Math.round(((map.getBearing() % 360) + 360) % 360);
-      setMapBearing(b);
       if (!isProgrammaticRotateRef.current) {
         setAutoRotateHeading(false);
       }
-      const c = map.getCenter();
-      onViewChangeRef.current({ lat: c.lat, lng: c.lng, zoom: map.getZoom(), bearing: b });
+      if (rotateRafId != null) return;
+      rotateRafId = requestAnimationFrame(() => {
+        rotateRafId = null;
+        if (!mapRef.current) return;
+        const b = Math.round(((mapRef.current.getBearing() % 360) + 360) % 360);
+        setMapBearing((prev) => (prev === b ? prev : b));
+      });
     });
 
     const syncView = () => {
       isProgrammaticMoveRef.current = false;
       const c = map.getCenter();
       const b = Math.round(((map.getBearing() % 360) + 360) % 360);
+      setMapBearing((prev) => (prev === b ? prev : b));
       onViewChangeRef.current({ lat: c.lat, lng: c.lng, zoom: map.getZoom(), bearing: b });
     };
     map.on('moveend', syncView);
     map.on('zoomend', syncView);
+    map.on('rotateend', syncView);
 
-    // ResizeObserver + initial frame ensure center map stays crisp when mobile/vertical panels resize
+    // Non-blocking rAF ResizeObserver avoids layout thrashing & stuttering when panels animate
+    let resizeRafId: number | null = null;
     const ro = new ResizeObserver(() => {
-      map.invalidateSize();
+      if (resizeRafId != null) cancelAnimationFrame(resizeRafId);
+      resizeRafId = requestAnimationFrame(() => {
+        resizeRafId = null;
+        map.invalidateSize({ pan: false, debounceMoveend: true });
+      });
     });
     ro.observe(containerRef.current);
-    const rafId = requestAnimationFrame(() => map.invalidateSize());
-    const settleTimer = setTimeout(() => map.invalidateSize(), 150);
+    const rafId = requestAnimationFrame(() => map.invalidateSize({ pan: false }));
+    const settleTimer = setTimeout(() => map.invalidateSize({ pan: false }), 160);
 
     mapRef.current = map;
 
     return () => {
       cancelAnimationFrame(rafId);
+      if (rotateRafId != null) cancelAnimationFrame(rotateRafId);
+      if (resizeRafId != null) cancelAnimationFrame(resizeRafId);
+      if (gpsGlideRef.current?.rafId != null) cancelAnimationFrame(gpsGlideRef.current.rafId);
+      if (simGlideRef.current?.rafId != null) cancelAnimationFrame(simGlideRef.current.rafId);
+      if (vehGlideRef.current?.rafId != null) cancelAnimationFrame(vehGlideRef.current.rafId);
       clearTimeout(settleTimer);
       ro.disconnect();
       map.remove();
       mapRef.current = null;
       tileLayerRef.current = null;
+      routeDoneLineRef.current = null;
+      routeAheadCasingRef.current = null;
+      routeAheadLineRef.current = null;
+      gpsCircleRef.current = null;
+      gpsMarkerRef.current = null;
+      gpsMarkerIsArrowRef.current = null;
+      vehMarkerRef.current = null;
+      vehMarkerCarOnRef.current = null;
+      simGuideLineRef.current = null;
+      simLeftDotRef.current = null;
+      simRightDotRef.current = null;
+      simMarkerRef.current = null;
     };
   }, []);
 
@@ -441,7 +582,7 @@ export default function VillageMap({
         attribution: cfg.attribution,
         maxZoom: cfg.maxZoom,
         maxNativeZoom,
-        keepBuffer: 4,
+        keepBuffer: 6,
         updateWhenZooming: false,
         updateWhenIdle: false,
         detectRetina: false,
@@ -750,17 +891,20 @@ export default function VillageMap({
         padding: [56, 56],
         maxZoom: 19,
         animate: true,
+        duration: 0.35,
       });
     } else if (focusTarget.zoom != null) {
       mapRef.current.setView([focusTarget.lat, focusTarget.lng], focusTarget.zoom, {
         animate: true,
-        duration: 0.25,
+        duration: 0.3,
       });
     } else {
-      // Preserve whatever zoom level and rotation the user currently chose!
+      // Smoothly glide camera without snapping zoom or interrupting movement
       mapRef.current.panTo([focusTarget.lat, focusTarget.lng], {
         animate: true,
-        duration: 0.25,
+        duration: 0.32,
+        easeLinearity: 0.22,
+        noMoveStart: true,
       });
     }
   }, [focusTarget]);
@@ -1072,64 +1216,100 @@ export default function VillageMap({
     Boolean(onSelectRoad),
   ]);
 
-  // Render Company Simulation Cursor + Left/Right Orientation Guides
+  // Render Company Simulation Cursor + Left/Right Orientation Guides with 60fps in-place glide
   useEffect(() => {
     const group = simulationLayerRef.current;
     if (!group) return;
-    group.clearLayers();
-    if (!simulationSimPoint) return;
 
-    const sp = simulationSimPoint;
-    const leftPt = offsetCoord(sp, (sp.headingDeg + 270) % 360, 7);
-    const rightPt = offsetCoord(sp, (sp.headingDeg + 90) % 360, 7);
-
-    L.polyline(
-      [
-        [leftPt.lat, leftPt.lng],
-        [sp.lat, sp.lng],
-        [rightPt.lat, rightPt.lng],
-      ],
-      {
-        color: '#0284c7',
-        weight: 2.5,
-        opacity: 0.78,
-        dashArray: '4 4',
-        interactive: false,
+    if (!simulationSimPoint) {
+      if (simGlideRef.current?.rafId != null) {
+        cancelAnimationFrame(simGlideRef.current.rafId);
       }
-    ).addTo(group);
+      simGlideRef.current = null;
+      simGuideLineRef.current = null;
+      simLeftDotRef.current = null;
+      simRightDotRef.current = null;
+      simMarkerRef.current = null;
+      group.clearLayers();
+      return;
+    }
 
-    L.circleMarker([leftPt.lat, leftPt.lng], {
-      radius: 4.5,
-      color: '#ffffff',
-      weight: 1.5,
-      fillColor: '#047857',
-      fillOpacity: 0.95,
-      interactive: false,
-    }).addTo(group);
+    if (!simMarkerRef.current) {
+      group.clearLayers();
+      const sp = simulationSimPoint;
+      const leftPt = offsetCoord(sp, (sp.headingDeg + 270) % 360, 7);
+      const rightPt = offsetCoord(sp, (sp.headingDeg + 90) % 360, 7);
 
-    L.circleMarker([rightPt.lat, rightPt.lng], {
-      radius: 4.5,
-      color: '#ffffff',
-      weight: 1.5,
-      fillColor: '#d97706',
-      fillOpacity: 0.95,
-      interactive: false,
-    }).addTo(group);
+      simGuideLineRef.current = L.polyline(
+        [
+          [leftPt.lat, leftPt.lng],
+          [sp.lat, sp.lng],
+          [rightPt.lat, rightPt.lng],
+        ],
+        {
+          color: '#0284c7',
+          weight: 2.5,
+          opacity: 0.78,
+          dashArray: '4 4',
+          interactive: false,
+        }
+      ).addTo(group);
 
-    const simIcon = L.divIcon({
-      className: 'grampath-sim-studio-cursor',
-      iconSize: [36, 36],
-      iconAnchor: [18, 18],
-      html: `<div style="width:36px;height:36px;border-radius:999px;background:rgba(2,132,199,0.28);display:flex;align-items:center;justify-content:center;"><div style="width:24px;height:24px;border-radius:999px;background:#0284c7;border:2.5px solid #ffffff;box-shadow:0 2px 8px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;"><svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg></div></div>`,
-    });
-    L.marker([sp.lat, sp.lng], {
-      icon: simIcon,
-      zIndexOffset: 940,
-      rotateWithView: true,
-      rotation: (sp.headingDeg * Math.PI) / 180,
-    })
-      .bindTooltip('Simulation Position')
-      .addTo(group);
+      simLeftDotRef.current = L.circleMarker([leftPt.lat, leftPt.lng], {
+        radius: 4.5,
+        color: '#ffffff',
+        weight: 1.5,
+        fillColor: '#047857',
+        fillOpacity: 0.95,
+        interactive: false,
+      }).addTo(group);
+
+      simRightDotRef.current = L.circleMarker([rightPt.lat, rightPt.lng], {
+        radius: 4.5,
+        color: '#ffffff',
+        weight: 1.5,
+        fillColor: '#d97706',
+        fillOpacity: 0.95,
+        interactive: false,
+      }).addTo(group);
+
+      const simIcon = L.divIcon({
+        className: 'grampath-sim-studio-cursor',
+        iconSize: [36, 36],
+        iconAnchor: [18, 18],
+        html: `<div style="width:36px;height:36px;border-radius:999px;background:rgba(2,132,199,0.28);display:flex;align-items:center;justify-content:center;"><div style="width:24px;height:24px;border-radius:999px;background:#0284c7;border:2.5px solid #ffffff;box-shadow:0 2px 8px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;"><svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg></div></div>`,
+      });
+      simMarkerRef.current = L.marker([sp.lat, sp.lng], {
+        icon: simIcon,
+        zIndexOffset: 940,
+        rotateWithView: true,
+        rotation: (sp.headingDeg * Math.PI) / 180,
+      })
+        .bindTooltip('Simulation Position')
+        .addTo(group);
+    }
+
+    animateCursorGlide(
+      simGlideRef,
+      simulationSimPoint.lat,
+      simulationSimPoint.lng,
+      simulationSimPoint.headingDeg,
+      190,
+      (curLat, curLng, curBrg) => {
+        const curPt = { lat: curLat, lng: curLng };
+        const leftPt = offsetCoord(curPt, (curBrg + 270) % 360, 7);
+        const rightPt = offsetCoord(curPt, (curBrg + 90) % 360, 7);
+        simGuideLineRef.current?.setLatLngs([
+          [leftPt.lat, leftPt.lng],
+          [curLat, curLng],
+          [rightPt.lat, rightPt.lng],
+        ]);
+        simLeftDotRef.current?.setLatLng([leftPt.lat, leftPt.lng]);
+        simRightDotRef.current?.setLatLng([rightPt.lat, rightPt.lng]);
+        simMarkerRef.current?.setLatLng([curLat, curLng]);
+        simMarkerRef.current?.setRotation((curBrg * Math.PI) / 180);
+      }
+    );
   }, [simulationSimPoint]);
 
   // Render Road Editor Vertices, Drawn Line Preview & Live Magnetic Snap Target (between A & B)
@@ -1407,6 +1587,8 @@ export default function VillageMap({
     }
   }, [roadEditor, roads, liveRoadSnap]);
 
+  const hasActiveRouteConnector = Boolean(routeResult?.reachable && routeResult.polyline.length >= 2);
+
   // Render Houses: hidden completely in Clean Map View (`hideHouses`), or isolated to targetHouse during navigation
   useEffect(() => {
     const group = housesLayerRef.current;
@@ -1435,8 +1617,7 @@ export default function VillageMap({
       const isPoi = pt !== 'house';
       const bg = getPlaceColor(pt, h.shopCategory, h.side, isStart, isTarget);
 
-      const hasRouteConnector =
-        (isTarget || isStart) && Boolean(routeResult?.reachable && routeResult.polyline.length >= 2);
+      const hasRouteConnector = (isTarget || isStart) && hasActiveRouteConnector;
       if (!hasRouteConnector) {
         L.polyline(
           [
@@ -1550,7 +1731,7 @@ export default function VillageMap({
     isolateNavigation,
     hideHouses,
     publicPoiOnly,
-    routeResult,
+    hasActiveRouteConnector,
     darkMode,
   ]);
 
@@ -2096,9 +2277,9 @@ export default function VillageMap({
       .addTo(group);
   }, [autoMapXOverlay]);
 
-  // Render Alternative Routes & Live Split Navigation Route (Walked Behind vs Remaining Ahead)
+  // Static Route Overlay (Alt routes, capped chevrons, turn pins, start/end connectors) — NEVER cleared on GPS ticks!
   useEffect(() => {
-    const group = routeLayerRef.current;
+    const group = routeStaticLayerRef.current;
     if (!group) return;
     group.clearLayers();
     if (!targetHouse || !routeResult?.reachable || routeResult.polyline.length < 2) return;
@@ -2130,6 +2311,7 @@ export default function VillageMap({
         dashArray: '7 6',
         lineCap: 'round',
         lineJoin: 'round',
+        smoothFactor: 1.4,
         interactive: true,
       })
         .bindTooltip(`${shortTag} · Tap to select`, { sticky: true })
@@ -2140,7 +2322,6 @@ export default function VillageMap({
         onSelectRouteIndexRef.current?.(idx);
       });
 
-      // Place a clickable midpoint label pill so users immediately see every alternative path
       const midIdx = Math.floor(alt.polyline.length / 2);
       const midPt = alt.polyline[midIdx];
       if (midPt) {
@@ -2163,44 +2344,6 @@ export default function VillageMap({
       }
     }
 
-    // Already covered behind user
-    if (liveProgress && liveProgress.completedPolyline.length >= 2) {
-      const doneLatLngs = liveProgress.completedPolyline.map(
-        (p) => [p.lat, p.lng] as [number, number]
-      );
-      L.polyline(doneLatLngs, {
-        color: '#94a3b8',
-        weight: 5,
-        opacity: 0.7,
-        dashArray: '4 6',
-        lineCap: 'round',
-        lineJoin: 'round',
-      }).addTo(group);
-    }
-
-    // Remaining road ahead of user
-    const aheadPts =
-      liveProgress && liveProgress.remainingPolyline.length >= 2
-        ? liveProgress.remainingPolyline
-        : routeResult.polyline;
-    const aheadLatLngs = aheadPts.map((p) => [p.lat, p.lng] as [number, number]);
-
-    L.polyline(aheadLatLngs, {
-      color: '#1e1b4b',
-      weight: 10,
-      opacity: 0.22,
-      lineCap: 'round',
-      lineJoin: 'round',
-    }).addTo(group);
-
-    L.polyline(aheadLatLngs, {
-      color: '#2563eb',
-      weight: 6,
-      opacity: 0.96,
-      lineCap: 'round',
-      lineJoin: 'round',
-    }).addTo(group);
-
     if ((startHouse || alternativeRoutes.length > 1) && routeResult.polyline.length >= 2) {
       const selMidPt = routeResult.polyline[Math.floor(routeResult.polyline.length / 2)];
       if (selMidPt) {
@@ -2209,8 +2352,8 @@ export default function VillageMap({
         )}`;
         const selIcon = L.divIcon({
           className: 'grampath-active-route-badge',
-          iconSize: [132, 24],
-          iconAnchor: [66, 12],
+          iconSize: [148, 24],
+          iconAnchor: [74, 12],
           html: `<div style="height:24px;padding:0 8px;border-radius:6px;background:#1d4ed8;color:#ffffff;border:2px solid #ffffff;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-shadow:0 2px 6px rgba(15,23,42,0.35);">${activeLabel}</div>`,
         });
         L.marker([selMidPt.lat, selMidPt.lng], {
@@ -2221,14 +2364,15 @@ export default function VillageMap({
       }
     }
 
-    // Subtle directional chevrons every ~26m along remaining route so road direction is unmistakable
+    // Capped directional chevrons (max ~32 along full route so 100km OSRM paths stay 60fps!)
+    const fullPts = routeResult.polyline;
+    const chevronIntervalMeters = Math.max(28, Math.round(routeResult.totalDistanceMeters / 32));
     let accum = 0;
-    for (let i = 1; i < aheadPts.length; i++) {
-      const a = aheadPts[i - 1];
-      const b = aheadPts[i];
-      const segLen = haversineMeters(a, b);
-      accum += segLen;
-      if (accum >= 26) {
+    for (let i = 1; i < fullPts.length; i++) {
+      const a = fullPts[i - 1];
+      const b = fullPts[i];
+      accum += haversineMeters(a, b);
+      if (accum >= chevronIntervalMeters) {
         accum = 0;
         const brg = calculateBearing(a, b);
         const arrowIcon = L.divIcon({
@@ -2246,14 +2390,15 @@ export default function VillageMap({
       }
     }
 
-    // Show clean visual pins at actual turns and curves along the selected route
-    for (const inst of routeResult.instructions) {
-      if (inst.turnType === 'depart' || inst.turnType === 'arrive' || inst.turnType === 'straight') {
-        continue;
-      }
+    // Show clean visual pins at actual turns and curves (capped for ultra-long OSRM routes)
+    const turnInsts = routeResult.instructions.filter(
+      (inst) => inst.turnType !== 'depart' && inst.turnType !== 'arrive' && inst.turnType !== 'straight'
+    );
+    const turnStride = Math.max(1, Math.ceil(turnInsts.length / 40));
+    for (let ti = 0; ti < turnInsts.length; ti += turnStride) {
+      const inst = turnInsts[ti];
       const isCurve = inst.turnType === 'slight_left' || inst.turnType === 'slight_right';
-      const isNextAnchor =
-        liveProgress?.nextInstruction?.id === inst.id || activeInstruction?.id === inst.id;
+      const isNextAnchor = activeInstruction?.id === inst.id;
       L.circleMarker([inst.anchorPoint.lat, inst.anchorPoint.lng], {
         radius: isNextAnchor ? 7 : 5,
         color: '#ffffff',
@@ -2265,7 +2410,6 @@ export default function VillageMap({
         .addTo(group);
     }
 
-    // Start house (Point A) dotted connector + dot when checking route between 2 houses in Preview
     if (startHouse && routeResult.polyline.length >= 1) {
       const startRoadPt = routeResult.polyline[0];
       L.polyline(
@@ -2297,8 +2441,7 @@ export default function VillageMap({
         .addTo(group);
     }
 
-    // End route strictly on the road (or Car drop-off point if narrow lane ahead) with dotted connector to house
-    const routeEndPt = aheadPts[aheadPts.length - 1];
+    const routeEndPt = fullPts[fullPts.length - 1];
     if (routeEndPt) {
       const isCarStop = Boolean(routeResult.carPartialStop);
       L.polyline(
@@ -2327,90 +2470,224 @@ export default function VillageMap({
             ? `Car stops here · Walk ${formatDistance(
                 routeResult.lastMileWalkMeters ?? 0
               )} to House ${targetHouse.houseNumber}`
+            : targetHouse.roadId === '__osm_external__'
+            ? `Arrive at ${targetHouse.shopName || targetHouse.villageName}`
             : `Stop here on road · House ${targetHouse.houseNumber}${
                 targetHouse.shopName ? ` (${targetHouse.shopName})` : ''
               } (${targetHouse.side === 'left' ? 'Left' : 'Right'})`
         )
         .addTo(group);
     }
-  }, [routeResult, alternativeRoutes, liveProgress, startHouse, targetHouse, activeInstruction]);
+  }, [routeResult, alternativeRoutes, startHouse, targetHouse, activeInstruction]);
 
-  // Render Live GPS User Position + Heading Arrow (rotates accurately with map view)
+  // Dynamic Route Polylines (In-place setLatLngs update on every tick -> 0.2ms, zero flicker!)
+  useEffect(() => {
+    const group = routeDynamicLayerRef.current;
+    if (!group) return;
+
+    if (!targetHouse || !routeResult?.reachable || routeResult.polyline.length < 2) {
+      routeDoneLineRef.current = null;
+      routeAheadCasingRef.current = null;
+      routeAheadLineRef.current = null;
+      group.clearLayers();
+      return;
+    }
+
+    const doneLatLngs =
+      liveProgress && liveProgress.completedPolyline.length >= 2
+        ? liveProgress.completedPolyline.map((p) => [p.lat, p.lng] as [number, number])
+        : [];
+    const aheadPts =
+      liveProgress && liveProgress.remainingPolyline.length >= 2
+        ? liveProgress.remainingPolyline
+        : routeResult.polyline;
+    const aheadLatLngs = aheadPts.map((p) => [p.lat, p.lng] as [number, number]);
+
+    if (!routeAheadLineRef.current || !routeAheadCasingRef.current || !routeDoneLineRef.current) {
+      group.clearLayers();
+      routeDoneLineRef.current = L.polyline(doneLatLngs, {
+        color: '#94a3b8',
+        weight: 5,
+        opacity: 0.7,
+        dashArray: '4 6',
+        lineCap: 'round',
+        lineJoin: 'round',
+        smoothFactor: 1.4,
+        interactive: false,
+      }).addTo(group);
+
+      routeAheadCasingRef.current = L.polyline(aheadLatLngs, {
+        color: '#1e1b4b',
+        weight: 10,
+        opacity: 0.22,
+        lineCap: 'round',
+        lineJoin: 'round',
+        smoothFactor: 1.4,
+        interactive: false,
+      }).addTo(group);
+
+      routeAheadLineRef.current = L.polyline(aheadLatLngs, {
+        color: '#2563eb',
+        weight: 6,
+        opacity: 0.96,
+        lineCap: 'round',
+        lineJoin: 'round',
+        smoothFactor: 1.4,
+        interactive: false,
+      }).addTo(group);
+    } else {
+      routeDoneLineRef.current.setLatLngs(doneLatLngs);
+      routeAheadCasingRef.current.setLatLngs(aheadLatLngs);
+      routeAheadLineRef.current.setLatLngs(aheadLatLngs);
+    }
+  }, [routeResult, liveProgress, targetHouse]);
+
+  // Render Live GPS User Position + Heading Arrow with 60fps in-place rAF glide
   useEffect(() => {
     const group = gpsLayerRef.current;
     if (!group) return;
-    group.clearLayers();
-    if (hideGpsMarker) return;
 
-    if (currentGps.accuracy && currentGps.accuracy > 0 && currentGps.accuracy < 150) {
-      L.circle([currentGps.lat, currentGps.lng], {
-        radius: currentGps.accuracy,
+    if (hideGpsMarker) {
+      if (gpsGlideRef.current?.rafId != null) {
+        cancelAnimationFrame(gpsGlideRef.current.rafId);
+      }
+      gpsGlideRef.current = null;
+      gpsCircleRef.current = null;
+      gpsMarkerRef.current = null;
+      gpsMarkerIsArrowRef.current = null;
+      group.clearLayers();
+      return;
+    }
+
+    const hasAccuracyRing = Boolean(
+      currentGps.accuracy && currentGps.accuracy > 0 && currentGps.accuracy < 150
+    );
+    const hasHeading = userHeadingDeg != null && Number.isFinite(userHeadingDeg);
+
+    if (gpsMarkerIsArrowRef.current !== hasHeading || !gpsMarkerRef.current) {
+      group.clearLayers();
+      gpsCircleRef.current = L.circle([currentGps.lat, currentGps.lng], {
+        radius: hasAccuracyRing ? currentGps.accuracy! : 0,
         color: '#0284c7',
         weight: 1,
         fillColor: '#38bdf8',
-        fillOpacity: 0.16,
+        fillOpacity: hasAccuracyRing ? 0.16 : 0,
+        opacity: hasAccuracyRing ? 1 : 0,
+        interactive: false,
       }).addTo(group);
-    }
 
-    if (userHeadingDeg != null && Number.isFinite(userHeadingDeg)) {
-      const arrowIcon = L.divIcon({
-        className: 'grampath-user-heading',
-        iconSize: [28, 28],
-        iconAnchor: [14, 14],
-        html: `<div style="width:28px;height:28px;border-radius:999px;background:rgba(2,132,199,0.22);display:flex;align-items:center;justify-content:center;"><div style="width:20px;height:20px;border-radius:999px;background:#0284c7;border:2.5px solid #ffffff;box-shadow:0 2px 6px rgba(15,23,42,0.4);display:flex;align-items:center;justify-content:center;"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 1.5L9.8 9.5L6 7.5L2.2 9.5L6 1.5Z" fill="#ffffff"/></svg></div></div>`,
+      if (hasHeading) {
+        const arrowIcon = L.divIcon({
+          className: 'grampath-user-heading',
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+          html: `<div style="width:28px;height:28px;border-radius:999px;background:rgba(2,132,199,0.22);display:flex;align-items:center;justify-content:center;"><div style="width:20px;height:20px;border-radius:999px;background:#0284c7;border:2.5px solid #ffffff;box-shadow:0 2px 6px rgba(15,23,42,0.4);display:flex;align-items:center;justify-content:center;"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 1.5L9.8 9.5L6 7.5L2.2 9.5L6 1.5Z" fill="#ffffff"/></svg></div></div>`,
+        });
+        gpsMarkerRef.current = L.marker([currentGps.lat, currentGps.lng], {
+          icon: arrowIcon,
+          rotateWithView: true,
+          rotation: ((userHeadingDeg ?? 0) * Math.PI) / 180,
+          zIndexOffset: 920,
+        })
+          .bindTooltip('You (Moving)')
+          .addTo(group);
+      } else {
+        gpsMarkerRef.current = L.circleMarker([currentGps.lat, currentGps.lng], {
+          radius: 8,
+          color: '#ffffff',
+          weight: 2.5,
+          fillColor: '#0284c7',
+          fillOpacity: 1,
+        })
+          .bindTooltip('You')
+          .addTo(group);
+      }
+      gpsMarkerIsArrowRef.current = hasHeading;
+    } else if (gpsCircleRef.current) {
+      gpsCircleRef.current.setRadius(hasAccuracyRing ? currentGps.accuracy! : 0);
+      gpsCircleRef.current.setStyle({
+        fillOpacity: hasAccuracyRing ? 0.16 : 0,
+        opacity: hasAccuracyRing ? 1 : 0,
       });
-      L.marker([currentGps.lat, currentGps.lng], {
-        icon: arrowIcon,
-        rotateWithView: true,
-        rotation: (userHeadingDeg * Math.PI) / 180,
-      })
-        .bindTooltip('You (Moving)')
-        .addTo(group);
-    } else {
-      L.circleMarker([currentGps.lat, currentGps.lng], {
-        radius: 8,
-        color: '#ffffff',
-        weight: 2.5,
-        fillColor: '#0284c7',
-        fillOpacity: 1,
-      })
-        .bindTooltip('You')
-        .addTo(group);
     }
-  }, [currentGps, userHeadingDeg, hideGpsMarker]);
 
-  // Render Animated Vehicle Simulator Marker (Car ON vs Narrow No-Car Mode)
+    const targetBearing = hasHeading ? userHeadingDeg! : gpsGlideRef.current?.bearing ?? 0;
+    animateCursorGlide(
+      gpsGlideRef,
+      currentGps.lat,
+      currentGps.lng,
+      targetBearing,
+      240,
+      (curLat, curLng, curBrg) => {
+        gpsCircleRef.current?.setLatLng([curLat, curLng]);
+        gpsMarkerRef.current?.setLatLng([curLat, curLng]);
+        if (hasHeading && gpsMarkerRef.current && 'setRotation' in gpsMarkerRef.current) {
+          (gpsMarkerRef.current as L.Marker).setRotation((curBrg * Math.PI) / 180);
+        }
+      }
+    );
+  }, [currentGps.lat, currentGps.lng, currentGps.accuracy, userHeadingDeg, hideGpsMarker]);
+
+  // Render Animated Vehicle Simulator Marker with 60fps in-place glide (Car ON vs Narrow No-Car)
   useEffect(() => {
     const group = vehicleSimLayerRef.current;
     if (!group) return;
-    group.clearLayers();
-    if (!vehicleOverlay?.active || !vehicleOverlay.simPoint) return;
+
+    if (!vehicleOverlay?.active || !vehicleOverlay.simPoint) {
+      if (vehGlideRef.current?.rafId != null) {
+        cancelAnimationFrame(vehGlideRef.current.rafId);
+      }
+      vehGlideRef.current = null;
+      vehMarkerRef.current = null;
+      vehMarkerCarOnRef.current = null;
+      group.clearLayers();
+      return;
+    }
 
     const sp = vehicleOverlay.simPoint;
     const isCar = vehicleOverlay.carOn;
-    const bg = isCar ? '#059669' : '#ea580c';
-    const halo = isCar ? 'rgba(16,185,129,0.3)' : 'rgba(234,88,12,0.28)';
-    const badgeSvg = isCar
-      ? `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/></svg>`
-      : `<svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg>`;
 
-    const vehIcon = L.divIcon({
-      className: 'grampath-vehicle-sim',
-      iconSize: [42, 42],
-      iconAnchor: [21, 21],
-      html: `<div style="width:42px;height:42px;border-radius:999px;background:${halo};display:flex;align-items:center;justify-content:center;"><div style="width:30px;height:30px;border-radius:999px;background:${bg};border:2.5px solid #ffffff;box-shadow:0 3px 10px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;">${badgeSvg}</div></div>`,
-    });
+    if (vehMarkerCarOnRef.current !== isCar || !vehMarkerRef.current) {
+      group.clearLayers();
+      const bg = isCar ? '#059669' : '#ea580c';
+      const halo = isCar ? 'rgba(16,185,129,0.3)' : 'rgba(234,88,12,0.28)';
+      const badgeSvg = isCar
+        ? `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/></svg>`
+        : `<svg width="13" height="13" viewBox="0 0 12 12" fill="none"><path d="M6 1L10.2 9.5L6 7.5L1.8 9.5L6 1Z" fill="#ffffff"/></svg>`;
 
-    L.marker([sp.lat, sp.lng], {
-      icon: vehIcon,
-      zIndexOffset: 990,
-      rotateWithView: !isCar,
-      rotation: isCar ? 0 : (sp.headingDeg * Math.PI) / 180,
-      interactive: false,
-    })
-      .bindTooltip(isCar ? 'CAR ON (Car Fits Here)' : 'CAR OFF (Narrow / No Car)')
-      .addTo(group);
-  }, [vehicleOverlay]);
+      const vehIcon = L.divIcon({
+        className: 'grampath-vehicle-sim',
+        iconSize: [42, 42],
+        iconAnchor: [21, 21],
+        html: `<div style="width:42px;height:42px;border-radius:999px;background:${halo};display:flex;align-items:center;justify-content:center;"><div style="width:30px;height:30px;border-radius:999px;background:${bg};border:2.5px solid #ffffff;box-shadow:0 3px 10px rgba(15,23,42,0.45);display:flex;align-items:center;justify-content:center;">${badgeSvg}</div></div>`,
+      });
+
+      vehMarkerRef.current = L.marker([sp.lat, sp.lng], {
+        icon: vehIcon,
+        zIndexOffset: 990,
+        rotateWithView: !isCar,
+        rotation: isCar ? 0 : (sp.headingDeg * Math.PI) / 180,
+        interactive: false,
+      })
+        .bindTooltip(isCar ? 'CAR ON (Car Fits Here)' : 'CAR OFF (Narrow / No Car)')
+        .addTo(group);
+      vehMarkerCarOnRef.current = isCar;
+    }
+
+    animateCursorGlide(
+      vehGlideRef,
+      sp.lat,
+      sp.lng,
+      sp.headingDeg,
+      160,
+      (curLat, curLng, curBrg) => {
+        vehMarkerRef.current?.setLatLng([curLat, curLng]);
+        if (!isCar && vehMarkerRef.current) {
+          vehMarkerRef.current.setRotation((curBrg * Math.PI) / 180);
+        }
+      }
+    );
+  }, [vehicleOverlay?.active, vehicleOverlay?.carOn, vehicleOverlay?.simPoint]);
 
   return (
     <div
@@ -2576,9 +2853,11 @@ export default function VillageMap({
                   <div className="flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
                     <span className="text-emerald-300 font-semibold">
                       {isArrivedStep
-                        ? `Target: House ${targetHouse.houseNumber}${
-                            targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
-                          }`
+                        ? targetHouse.roadId === '__osm_external__'
+                          ? `Arrived: ${targetHouse.shopName || targetHouse.villageName}`
+                          : `Target: House ${targetHouse.houseNumber}${
+                              targetHouse.shopName ? ` · ${targetHouse.shopName}` : ''
+                            }`
                         : distanceToNextTurnMeters != null
                         ? `In ${formatDistance(distanceToNextTurnMeters)}`
                         : formatDistance(activeInstruction.distanceMeters)}
@@ -2615,13 +2894,19 @@ export default function VillageMap({
                   {liveProgress.movementStatus === 'away'
                     ? 'Moving away · Turn back toward route'
                     : liveProgress.movementStatus === 'towards'
-                    ? `Moving toward House ${targetHouse.houseNumber}`
+                    ? targetHouse.roadId === '__osm_external__'
+                      ? `Moving toward ${targetHouse.shopName || targetHouse.villageName}`
+                      : `Moving toward House ${targetHouse.houseNumber}`
                     : liveProgress.offRouteMeters > 12
                     ? `Off road by ${liveProgress.offRouteMeters} m`
                     : `On road · ${formatDistance(liveProgress.coveredMeters)} walked`}
                 </span>
                 <span className="font-mono tabular-nums text-slate-300">
-                  {targetHouse.side === 'left' ? 'Left Side' : 'Right Side'}
+                  {targetHouse.roadId === '__osm_external__'
+                    ? 'OpenStreetMap'
+                    : targetHouse.side === 'left'
+                    ? 'Left Side'
+                    : 'Right Side'}
                 </span>
               </div>
             )}
@@ -2632,3 +2917,5 @@ export default function VillageMap({
     </div>
   );
 }
+
+export default memo(VillageMap);

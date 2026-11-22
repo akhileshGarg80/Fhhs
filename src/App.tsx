@@ -64,6 +64,7 @@ import type {
   VehicleSegmentAccess,
   VillageHouse,
   VillageRoad,
+  VillageRouteResult,
 } from './types/map.ts';
 import {
   type AheadRoadTarget,
@@ -100,6 +101,7 @@ import {
   PrecisionGpsSmoother,
   evaluateGpsFix,
 } from './utils/gpsFilter.ts';
+import { computeHybridVillageOsmRoutes } from './utils/hybridRouter.ts';
 import {
   type NominatimSearchResult,
   reverseGeocodeVillage,
@@ -126,6 +128,12 @@ import {
 } from './utils/storage.ts';
 
 type UserAccessRole = 'public' | 'company';
+
+const EMPTY_HOUSES: VillageHouse[] = [];
+const EMPTY_SEGMENTS: LatLngPoint[][] = [];
+const EMPTY_JUNCTIONS: RoadJunction[] = [];
+const EMPTY_ROUTES: VillageRouteResult[] = [];
+const NOOP_MAP_CLICK = () => {};
 
 type WorkspaceMode =
   | 'navigate'
@@ -218,9 +226,11 @@ export default function App() {
   const [areaResults, setAreaResults] = useState<NominatimSearchResult[]>([]);
   const [isSearchingArea, setIsSearchingArea] = useState(false);
 
-  // Search 2 (Navigate only): House Number Search
+  // Search 2 (Navigate only): House Number, Shop, OR OpenStreetMap City/Place Search
   const [houseQuery, setHouseQuery] = useState('');
   const [houseDropdownOpen, setHouseDropdownOpen] = useState(false);
+  const [osmPlaceResults, setOsmPlaceResults] = useState<NominatimSearchResult[]>([]);
+  const [isSearchingOsmPlaces, setIsSearchingOsmPlaces] = useState(false);
 
   // Accurate GPS State (Max 5m filter by default with Kalman smoothing)
   const [gpsPrecisionMode, setGpsPrecisionMode] = useState<GpsPrecisionMode>('accurate_5m');
@@ -271,6 +281,9 @@ export default function App() {
   const [currentNavStepIdx, setCurrentNavStepIdx] = useState(0);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [isSimulatingNav, setIsSimulatingNav] = useState(false);
+  const [osmHybridRoutes, setOsmHybridRoutes] = useState<VillageRouteResult[] | null>(null);
+  const [isComputingOsmRoute, setIsComputingOsmRoute] = useState(false);
+  const lastHybridFitKeyRef = useRef<string>('');
   const simIdxRef = useRef<number>(0);
   const lastSpokenRef = useRef<number>(-1);
   const arrivedHouseIdRef = useRef<string | null>(null);
@@ -279,6 +292,7 @@ export default function App() {
   const [previewFromHouseId, setPreviewFromHouseId] = useState<string | null>(null);
   const [previewToHouseId, setPreviewToHouseId] = useState<string | null>(null);
   const [previewSelectedRouteIndex, setPreviewSelectedRouteIndex] = useState(0);
+  const [previewOsmHybridRoutes, setPreviewOsmHybridRoutes] = useState<VillageRouteResult[] | null>(null);
 
   // Preview Hand Road Editor (Move Map default / Tiny Erase / Endpoint AutoMap / Draw / Undo / Redo)
   const [editorEnabled, setEditorEnabled] = useState(false);
@@ -1087,17 +1101,135 @@ export default function App() {
       .map((entry) => entry.h);
   }, [houses, houseQuery]);
 
-  // Compute all distinct saved-road routes from navOrigin to target House for active travelMode
-  const navRouteOptions = useMemo(() => {
+  // Debounced OpenStreetMap Cities & Places search for Navigate Search Bar 2
+  useEffect(() => {
+    if (mode !== 'navigate') return;
+    const q = houseQuery.trim();
+    if (q.length < 3) {
+      setOsmPlaceResults([]);
+      setIsSearchingOsmPlaces(false);
+      return;
+    }
+    let cancelled = false;
+    setIsSearchingOsmPlaces(true);
+    const timer = setTimeout(() => {
+      searchPlaceNominatim(q)
+        .then((res) => {
+          if (!cancelled) setOsmPlaceResults(res);
+        })
+        .catch(() => {
+          if (!cancelled) setOsmPlaceResults([]);
+        })
+        .finally(() => {
+          if (!cancelled) setIsSearchingOsmPlaces(false);
+        });
+    }, 360);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [mode, houseQuery]);
+
+  // Compute local village-road routes first (instant & offline)
+  const localNavRouteOptions = useMemo(() => {
     if (!targetHouse) return [];
+    if (targetHouse.roadId === '__osm_external__') return [];
     return findRoutesToHouse(roads, navOrigin, targetHouse, 8, travelMode);
   }, [targetHouse, roads, navOrigin, travelMode]);
+
+  // Decide when to invoke Hybrid Village Exit -> OpenStreetMap OSRM -> Destination Village Entry
+  const needsHybridOsm = useMemo(() => {
+    if (!targetHouse) return false;
+    if (targetHouse.roadId === '__osm_external__') return true;
+    const bestLocal = localNavRouteOptions[0];
+    if (bestLocal?.reachable && (bestLocal.localGapMeters ?? 0) <= 180) {
+      return false;
+    }
+    // If Car mode failed strictly due to intra-village narrow lanes while both ends are on same walk network,
+    // keep the village car-stop/switch-to-bike advisory rather than detouring onto external highways.
+    if (travelMode === 'car' && bestLocal && !bestLocal.reachable && roads.length > 0) {
+      const walkCheck = findRoutesToHouse(roads, navOrigin, targetHouse, 1, 'walk')[0];
+      if (walkCheck?.reachable && (walkCheck.localGapMeters ?? 0) <= 180) {
+        return false;
+      }
+    }
+    return true;
+  }, [targetHouse, localNavRouteOptions, travelMode, roads, navOrigin]);
+
+  useEffect(() => {
+    if (!targetHouse || !needsHybridOsm) {
+      setOsmHybridRoutes(null);
+      setIsComputingOsmRoute(false);
+      return;
+    }
+    let cancelled = false;
+    setIsComputingOsmRoute(true);
+    setOsmHybridRoutes(null);
+
+    computeHybridVillageOsmRoutes({
+      roads,
+      start: navOrigin,
+      targetHouse,
+      travelMode,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setOsmHybridRoutes(res);
+        const best = res[0];
+        const fitKey = `${targetHouse.id}_${travelMode}_${Math.round(navOrigin.lat * 1000)}_${Math.round(
+          navOrigin.lng * 1000
+        )}`;
+        if (best?.reachable && best.polyline.length >= 2 && lastHybridFitKeyRef.current !== fitKey) {
+          lastHybridFitKeyRef.current = fitKey;
+          setFocusTarget({
+            lat: targetHouse.lat,
+            lng: targetHouse.lng,
+            boundsPoints: [
+              { lat: navOrigin.lat, lng: navOrigin.lng },
+              ...best.polyline,
+              { lat: targetHouse.lat, lng: targetHouse.lng },
+            ],
+            key: Date.now(),
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOsmHybridRoutes([
+            {
+              reachable: false,
+              travelMode,
+              totalDistanceMeters: 0,
+              walkMinutes: 0,
+              bikeMinutes: 0,
+              carMinutes: 0,
+              polyline: [],
+              instructions: [],
+              reason: 'Could not reach OpenStreetMap road server right now.',
+            },
+          ]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsComputingOsmRoute(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [targetHouse, needsHybridOsm, roads, navOrigin, travelMode]);
+
+  const navRouteOptions = useMemo(() => {
+    if (!targetHouse) return [];
+    if (needsHybridOsm) return osmHybridRoutes ?? [];
+    return localNavRouteOptions;
+  }, [targetHouse, needsHybridOsm, osmHybridRoutes, localNavRouteOptions]);
 
   const safeSelectedRouteIndex =
     navRouteOptions.length > 0 ? Math.min(selectedRouteIndex, navRouteOptions.length - 1) : 0;
   const navRouteResult = navRouteOptions[safeSelectedRouteIndex] ?? null;
 
-  // Preview 2-Point (House A -> House B) Route Calculation
+  // Preview 2-Point (House A -> House B) Route Calculation (with OSRM bridge across disconnected villages)
   const previewFromHouse = useMemo(
     () => (previewFromHouseId ? houses.find((h) => h.id === previewFromHouseId) ?? null : null),
     [houses, previewFromHouseId]
@@ -1112,7 +1244,7 @@ export default function App() {
     if (previewToHouseId && !previewToHouse) setPreviewToHouseId(null);
   }, [previewFromHouseId, previewFromHouse, previewToHouseId, previewToHouse]);
 
-  const previewRouteOptions = useMemo(() => {
+  const localPreviewRouteOptions = useMemo(() => {
     if (!previewFromHouse || !previewToHouse || previewFromHouse.id === previewToHouse.id) {
       return [];
     }
@@ -1123,6 +1255,53 @@ export default function App() {
       8
     );
   }, [roads, previewFromHouse, previewToHouse]);
+
+  const previewNeedsHybrid = useMemo(() => {
+    if (!previewFromHouse || !previewToHouse || previewFromHouse.id === previewToHouse.id) {
+      return false;
+    }
+    const best = localPreviewRouteOptions[0];
+    return !best || !best.reachable || (best.localGapMeters ?? 0) > 180;
+  }, [previewFromHouse, previewToHouse, localPreviewRouteOptions]);
+
+  useEffect(() => {
+    if (!previewNeedsHybrid || !previewFromHouse || !previewToHouse) {
+      setPreviewOsmHybridRoutes(null);
+      return;
+    }
+    let cancelled = false;
+    computeHybridVillageOsmRoutes({
+      roads,
+      start: { lat: previewFromHouse.roadLat, lng: previewFromHouse.roadLng },
+      targetHouse: previewToHouse,
+      travelMode: 'walk',
+    })
+      .then((res) => {
+        if (!cancelled) setPreviewOsmHybridRoutes(res);
+      })
+      .catch(() => {
+        if (!cancelled) setPreviewOsmHybridRoutes(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewNeedsHybrid, previewFromHouse, previewToHouse, roads]);
+
+  const previewRouteOptions = useMemo(() => {
+    if (!previewFromHouse || !previewToHouse || previewFromHouse.id === previewToHouse.id) {
+      return [];
+    }
+    if (previewNeedsHybrid && previewOsmHybridRoutes && previewOsmHybridRoutes.length > 0) {
+      return previewOsmHybridRoutes;
+    }
+    return localPreviewRouteOptions;
+  }, [
+    previewFromHouse,
+    previewToHouse,
+    previewNeedsHybrid,
+    previewOsmHybridRoutes,
+    localPreviewRouteOptions,
+  ]);
 
   const previewSafeRouteIdx =
     previewRouteOptions.length > 0
@@ -1232,7 +1411,8 @@ export default function App() {
     if (!navRouteResult?.reachable || navRouteResult.polyline.length < 2) return;
     const poly = navRouteResult.polyline;
     const prevIdx = Math.min(simIdxRef.current, poly.length - 1);
-    const nextIdx = Math.min(prevIdx + 1, poly.length - 1);
+    const stepSize = Math.max(1, Math.floor(poly.length / 80));
+    const nextIdx = Math.min(prevIdx + stepSize, poly.length - 1);
     simIdxRef.current = nextIdx;
     const prevPt = poly[prevIdx];
     const pt = poly[nextIdx];
@@ -1247,9 +1427,11 @@ export default function App() {
       setIsSimulatingNav(false);
       setCurrentNavStepIdx(navRouteResult.instructions.length - 1);
       showToast(
-        `Arrived: House ${targetHouse?.houseNumber}${
-          targetHouse?.shopName ? ` (${targetHouse.shopName})` : ''
-        } is on your ${targetHouse?.side === 'left' ? 'Left' : 'Right'}!`
+        targetHouse?.roadId === '__osm_external__'
+          ? `Arrived at ${targetHouse.shopName || targetHouse.villageName}!`
+          : `Arrived: House ${targetHouse?.houseNumber}${
+              targetHouse?.shopName ? ` (${targetHouse.shopName})` : ''
+            } is on your ${targetHouse?.side === 'left' ? 'Left' : 'Right'}!`
       );
     }
   }, [navRouteResult, targetHouse, showToast]);
@@ -1516,13 +1698,58 @@ export default function App() {
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   }, []);
 
-  const handleHouseSearchSubmit = (e: React.FormEvent) => {
+  const buildOsmDestinationHouse = useCallback(
+    (item: NominatimSearchResult): VillageHouse => {
+      const lat = Number(item.lat);
+      const lng = Number(item.lon);
+      const parts = item.display_name
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const shortName = parts[0] || 'OpenStreetMap Place';
+      const regionSubtitle = parts.slice(1, 3).join(', ') || 'OpenStreetMap';
+      return {
+        id: `osm-${item.place_id}`,
+        houseNumber: 'OSM',
+        placeType: 'landmark',
+        shopName: shortName,
+        villageName: regionSubtitle,
+        roadId: '__osm_external__',
+        roadName: 'OpenStreetMap Road',
+        lat,
+        lng,
+        roadLat: lat,
+        roadLng: lng,
+        side: 'right',
+        createdAt: new Date().toISOString(),
+      };
+    },
+    []
+  );
+
+  const handleHouseSearchSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!houseQuery.trim()) return;
+    const q = houseQuery.trim();
+    if (!q) return;
     if (matchingHouses.length > 0) {
       startNavigateToHouse(matchingHouses[0]);
-    } else {
-      showToast(`"${houseQuery.trim()}" is not saved yet.`);
+      return;
+    }
+    if (osmPlaceResults.length > 0) {
+      startNavigateToHouse(buildOsmDestinationHouse(osmPlaceResults[0]));
+      return;
+    }
+    setIsSearchingOsmPlaces(true);
+    try {
+      const results = await searchPlaceNominatim(q);
+      setOsmPlaceResults(results);
+      if (results.length > 0) {
+        startNavigateToHouse(buildOsmDestinationHouse(results[0]));
+      } else {
+        showToast(`"${q}" was not found.`);
+      }
+    } finally {
+      setIsSearchingOsmPlaces(false);
     }
   };
 
@@ -4285,71 +4512,151 @@ export default function App() {
     return 'browse';
   }, [isPickingSpot, mode, amxSubMode, amxPickingStart, amxIsRunning, isRecording, isPaused, captureMode]);
 
-  const handleMapClick = (lat: number, lng: number) => {
-    if (mode === 'automapx' && amxSubMode === 'simulate' && selectedAmxSimRoad) {
-      const clickPt = { lat, lng };
-      const sampled = buildSimulatorWaypoints(selectedAmxSimRoad.points, 4);
-      let minDist = Infinity;
-      for (const pt of sampled) {
-        const d = haversineMeters(clickPt, pt);
-        if (d < minDist) minDist = d;
+  const handleMapClick = useCallback(
+    (lat: number, lng: number) => {
+      if (mode === 'automapx' && amxSubMode === 'simulate' && selectedAmxSimRoad) {
+        const clickPt = { lat, lng };
+        const sampled = buildSimulatorWaypoints(selectedAmxSimRoad.points, 4);
+        let minDist = Infinity;
+        for (const pt of sampled) {
+          const d = haversineMeters(clickPt, pt);
+          if (d < minDist) minDist = d;
+        }
+        if (minDist <= 45) {
+          setAmxSimJumpRequest({ lat, lng, key: Date.now() });
+        }
+        return;
       }
-      if (minDist <= 45) {
-        setAmxSimJumpRequest({ lat, lng, key: Date.now() });
+      if (interactionMode === 'pick_automapx_start') {
+        const snapHit = findNearestRoadSnap({ lat, lng }, roads, 14);
+        const startCoord = snapHit ? snapHit.point : { lat, lng };
+        const nextCur = {
+          lat: Number(startCoord.lat.toFixed(7)),
+          lng: Number(startCoord.lng.toFixed(7)),
+          headingDeg: amxCursorRef.current.headingDeg,
+        };
+        amxCursorRef.current = nextCur;
+        setAmxCursor(nextCur);
+        const startNode: AutoMapXNode = {
+          lat: nextCur.lat,
+          lng: nextCur.lng,
+          accuracy: 1.5,
+          timestamp: Date.now(),
+          headingDeg: nextCur.headingDeg,
+          cumulativeMeters: 0,
+          speedMps: amxSpeedRef.current,
+          momentLabel: snapHit ? `Start (${snapHit.roadName})` : 'Start',
+        };
+        amxPointsRef.current = [startNode];
+        setAmxPoints([startNode]);
+        amxTotalMetersRef.current = 0;
+        maybeDetectVillage(startCoord.lat, startCoord.lng);
+        return;
       }
-      return;
+      if (interactionMode === 'manual_trace') {
+        const snapHit = findNearestRoadSnap({ lat, lng }, roads, 14);
+        const chosen = snapHit ? snapHit.point : { lat, lng };
+        setWalkSegments((prev) => {
+          const next = prev.length > 0 ? [...prev] : [[]];
+          const lastIdx = next.length - 1;
+          next[lastIdx] = [
+            ...next[lastIdx],
+            { lat: chosen.lat, lng: chosen.lng, timestamp: Date.now() },
+          ];
+          return next;
+        });
+        return;
+      }
+      if (interactionMode === 'pick_user_location') {
+        setIsLiveGps(false);
+        const pt: LatLngPoint = { lat, lng, accuracy: 2.0, timestamp: Date.now() };
+        lastNavGpsRef.current = pt;
+        setUserLocation(pt);
+        setNavOrigin({ lat, lng });
+        setIsPickingSpot(false);
+        maybeDetectVillage(lat, lng);
+      }
+    },
+    [
+      mode,
+      amxSubMode,
+      selectedAmxSimRoad,
+      interactionMode,
+      roads,
+      maybeDetectVillage,
+    ]
+  );
+
+  const initialMapView = useMemo(() => mapViewRef.current, []);
+
+  const handleMapViewChange = useCallback(
+    (view: { lat: number; lng: number; zoom: number; bearing?: number }) => {
+      mapViewRef.current = view;
+    },
+    []
+  );
+
+  const handleMapUserDrag = useCallback(() => {
+    autoFollowGpsRef.current = false;
+    setIsFollowingGps(false);
+  }, []);
+
+  const handleVehUserDrag = useCallback(() => {
+    setVehAutoFollow(false);
+  }, []);
+
+  const handleLocateCenterGps = useCallback(() => {
+    handleLocateMe(true);
+  }, [handleLocateMe]);
+
+  const handleFitRoadsCenterGps = useCallback(() => {
+    handleFitAllRoadsOnly();
+  }, [handleFitAllRoadsOnly]);
+
+  const handleNavSelectRouteIndex = useCallback((idx: number) => {
+    setSelectedRouteIndex(idx);
+    setCurrentNavStepIdx(0);
+    simIdxRef.current = 0;
+    setIsSimulatingNav(false);
+  }, []);
+
+  const handleAmxCenterGps = useCallback(() => {
+    autoFollowGpsRef.current = true;
+    setIsFollowingGps(true);
+    if (amxSubMode === 'simulate' && amxSimPoint) {
+      setFocusTarget({ lat: amxSimPoint.lat, lng: amxSimPoint.lng, key: Date.now() });
+    } else if (amxIsRunning || amxPoints.length > 1) {
+      setFocusTarget({ lat: amxCursor.lat, lng: amxCursor.lng, key: Date.now() });
+    } else {
+      handleLocateMe(true);
     }
-    if (interactionMode === 'pick_automapx_start') {
-      // Snap automatically onto any existing saved road (even mid-segment A–B) within 14m!
-      const snapHit = findNearestRoadSnap({ lat, lng }, roads, 14);
-      const startCoord = snapHit ? snapHit.point : { lat, lng };
-      const nextCur = {
-        lat: Number(startCoord.lat.toFixed(7)),
-        lng: Number(startCoord.lng.toFixed(7)),
-        headingDeg: amxCursorRef.current.headingDeg,
-      };
-      amxCursorRef.current = nextCur;
-      setAmxCursor(nextCur);
-      const startNode: AutoMapXNode = {
-        lat: nextCur.lat,
-        lng: nextCur.lng,
-        accuracy: 1.5,
-        timestamp: Date.now(),
-        headingDeg: nextCur.headingDeg,
-        cumulativeMeters: 0,
-        speedMps: amxSpeedRef.current,
-        momentLabel: snapHit ? `Start (${snapHit.roadName})` : 'Start',
-      };
-      amxPointsRef.current = [startNode];
-      setAmxPoints([startNode]);
-      amxTotalMetersRef.current = 0;
-      maybeDetectVillage(startCoord.lat, startCoord.lng);
-      return;
-    }
-    if (interactionMode === 'manual_trace') {
-      const snapHit = findNearestRoadSnap({ lat, lng }, roads, 14);
-      const chosen = snapHit ? snapHit.point : { lat, lng };
-      setWalkSegments((prev) => {
-        const next = prev.length > 0 ? [...prev] : [[]];
-        const lastIdx = next.length - 1;
-        next[lastIdx] = [
-          ...next[lastIdx],
-          { lat: chosen.lat, lng: chosen.lng, timestamp: Date.now() },
-        ];
-        return next;
-      });
-      return;
-    }
-    if (interactionMode === 'pick_user_location') {
-      setIsLiveGps(false);
-      const pt: LatLngPoint = { lat, lng, accuracy: 2.0, timestamp: Date.now() };
-      lastNavGpsRef.current = pt;
-      setUserLocation(pt);
-      setNavOrigin({ lat, lng });
-      setIsPickingSpot(false);
-      maybeDetectVillage(lat, lng);
-    }
-  };
+  }, [amxSubMode, amxSimPoint, amxIsRunning, amxPoints.length, amxCursor.lat, amxCursor.lng, handleLocateMe]);
+
+  const walkLiveRoadSnap = useMemo(
+    () =>
+      mode === 'add' && walkNearestSnap
+        ? {
+            lat: walkNearestSnap.point.lat,
+            lng: walkNearestSnap.point.lng,
+            roadName: walkNearestSnap.roadName,
+            distMeters: walkNearestSnap.distMeters,
+          }
+        : null,
+    [mode, walkNearestSnap]
+  );
+
+  const amxLiveRoadSnap = useMemo(
+    () =>
+      mode === 'automapx' && amxSubMode === 'build' && amxNearestSnap
+        ? {
+            lat: amxNearestSnap.point.lat,
+            lng: amxNearestSnap.point.lng,
+            roadName: amxNearestSnap.roadName,
+            distMeters: amxNearestSnap.distMeters,
+          }
+        : null,
+    [mode, amxSubMode, amxNearestSnap]
+  );
 
   const isolateNavigation = mode === 'navigate' && Boolean(targetHouse);
 
@@ -4357,14 +4664,14 @@ export default function App() {
     <VillageMap
       roads={editorEnabled ? editorDraftRoads : roads}
       houses={houses}
-      draftHouses={[]}
-      activeWalkSegments={[]}
-      draftJunctions={[]}
+      draftHouses={EMPTY_HOUSES}
+      activeWalkSegments={EMPTY_SEGMENTS}
+      draftJunctions={EMPTY_JUNCTIONS}
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
       routeResult={editorEnabled ? null : previewRouteResult}
-      alternativeRoutes={editorEnabled ? [] : previewRouteOptions}
+      alternativeRoutes={editorEnabled ? EMPTY_ROUTES : previewRouteOptions}
       liveProgress={null}
       startHouse={editorEnabled ? null : previewFromHouse}
       targetHouse={editorEnabled ? null : previewToHouse}
@@ -4373,20 +4680,15 @@ export default function App() {
       activeInstruction={null}
       distanceToNextTurnMeters={null}
       interactionMode="browse"
-      onMapClick={() => {}}
+      onMapClick={NOOP_MAP_CLICK}
       onNavigateHouse={startNavigateToHouse}
       onSelectRouteIndex={setPreviewSelectedRouteIndex}
       onSelectPendingBranch={handleSelectPendingBranch}
-      onCenterGps={() => handleLocateMe(true)}
+      onCenterGps={handleLocateCenterGps}
       isFollowingGps={isFollowingGps}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
-      onUserDrag={() => {
-        autoFollowGpsRef.current = false;
-        setIsFollowingGps(false);
-      }}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
+      onUserDrag={handleMapUserDrag}
       focusTarget={focusTarget}
       roadEditor={previewMapRoadEditor}
     />
@@ -4403,7 +4705,7 @@ export default function App() {
         points: autoPoints,
         segmentAccess: autoSegmentAccess,
         simPoint: null,
-        houses: [],
+        houses: EMPTY_HOUSES,
       };
     }
     if (selectedAutoTrip) {
@@ -4411,7 +4713,7 @@ export default function App() {
         points: selectedAutoTrip.points,
         segmentAccess: selectedAutoTrip.segmentAccess,
         simPoint: autoSimPoint,
-        houses: [],
+        houses: EMPTY_HOUSES,
       };
     }
     return null;
@@ -4421,14 +4723,14 @@ export default function App() {
     <VillageMap
       roads={roads}
       houses={houses}
-      draftHouses={[]}
-      activeWalkSegments={[]}
-      draftJunctions={[]}
+      draftHouses={EMPTY_HOUSES}
+      activeWalkSegments={EMPTY_SEGMENTS}
+      draftJunctions={EMPTY_JUNCTIONS}
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
       routeResult={null}
-      alternativeRoutes={[]}
+      alternativeRoutes={EMPTY_ROUTES}
       liveProgress={null}
       targetHouse={null}
       darkMode={theme === 'dark'}
@@ -4438,19 +4740,14 @@ export default function App() {
       activeInstruction={null}
       distanceToNextTurnMeters={null}
       interactionMode="browse"
-      onMapClick={() => {}}
+      onMapClick={NOOP_MAP_CLICK}
       onNavigateHouse={startNavigateToHouse}
       onSelectPendingBranch={handleSelectPendingBranch}
-      onCenterGps={() => handleLocateMe(true)}
+      onCenterGps={handleLocateCenterGps}
       isFollowingGps={isFollowingGps}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
-      onUserDrag={() => {
-        autoFollowGpsRef.current = false;
-        setIsFollowingGps(false);
-      }}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
+      onUserDrag={handleMapUserDrag}
       focusTarget={focusTarget}
       autoTripOverlay={autoTripOverlay}
     />
@@ -4479,36 +4776,17 @@ export default function App() {
       interactionMode={interactionMode}
       onMapClick={handleMapClick}
       onNavigateHouse={startNavigateToHouse}
-      onSelectRouteIndex={(idx) => {
-        setSelectedRouteIndex(idx);
-        setCurrentNavStepIdx(0);
-        simIdxRef.current = 0;
-        setIsSimulatingNav(false);
-      }}
+      onSelectRouteIndex={handleNavSelectRouteIndex}
       onSelectPendingBranch={handleSelectPendingBranch}
       onExitNavigation={handleExitNavigation}
-      onCenterGps={() => handleLocateMe(true)}
+      onCenterGps={handleLocateCenterGps}
       isFollowingGps={isFollowingGps}
       topControlsOffset={mode === 'navigate'}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
-      onUserDrag={() => {
-        autoFollowGpsRef.current = false;
-        setIsFollowingGps(false);
-      }}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
+      onUserDrag={handleMapUserDrag}
       focusTarget={focusTarget}
-      liveRoadSnap={
-        mode === 'add' && walkNearestSnap
-          ? {
-              lat: walkNearestSnap.point.lat,
-              lng: walkNearestSnap.point.lng,
-              roadName: walkNearestSnap.roadName,
-              distMeters: walkNearestSnap.distMeters,
-            }
-          : null
-      }
+      liveRoadSnap={walkLiveRoadSnap}
     />
   );
 
@@ -4520,7 +4798,7 @@ export default function App() {
       rewindIndex: amxRewindIdx,
       isRunning: amxIsRunning,
       isPaused: amxIsPaused,
-      houses: amxSubMode === 'build' ? amxDraftHouses : [],
+      houses: amxSubMode === 'build' ? amxDraftHouses : EMPTY_HOUSES,
       simRoadPoints: amxSubMode === 'simulate' ? selectedAmxSimRoad?.points : undefined,
       simPoint: amxSubMode === 'simulate' ? amxSimPoint : null,
     }),
@@ -4541,14 +4819,14 @@ export default function App() {
     <VillageMap
       roads={roads}
       houses={houses}
-      draftHouses={[]}
-      activeWalkSegments={[]}
-      draftJunctions={[]}
+      draftHouses={EMPTY_HOUSES}
+      activeWalkSegments={EMPTY_SEGMENTS}
+      draftJunctions={EMPTY_JUNCTIONS}
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
       routeResult={null}
-      alternativeRoutes={[]}
+      alternativeRoutes={EMPTY_ROUTES}
       liveProgress={null}
       targetHouse={null}
       darkMode={theme === 'dark'}
@@ -4559,38 +4837,14 @@ export default function App() {
       onMapClick={handleMapClick}
       onNavigateHouse={startNavigateToHouse}
       onSelectPendingBranch={handleSelectPendingBranch}
-      onCenterGps={() => {
-        autoFollowGpsRef.current = true;
-        setIsFollowingGps(true);
-        if (amxSubMode === 'simulate' && amxSimPoint) {
-          setFocusTarget({ lat: amxSimPoint.lat, lng: amxSimPoint.lng, key: Date.now() });
-        } else if (amxIsRunning || amxPoints.length > 1) {
-          setFocusTarget({ lat: amxCursor.lat, lng: amxCursor.lng, key: Date.now() });
-        } else {
-          handleLocateMe(true);
-        }
-      }}
+      onCenterGps={handleAmxCenterGps}
       isFollowingGps={isFollowingGps}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
-      onUserDrag={() => {
-        autoFollowGpsRef.current = false;
-        setIsFollowingGps(false);
-      }}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
+      onUserDrag={handleMapUserDrag}
       focusTarget={focusTarget}
       autoMapXOverlay={autoMapXOverlay}
-      liveRoadSnap={
-        mode === 'automapx' && amxSubMode === 'build' && amxNearestSnap
-          ? {
-              lat: amxNearestSnap.point.lat,
-              lng: amxNearestSnap.point.lng,
-              roadName: amxNearestSnap.roadName,
-              distMeters: amxNearestSnap.distMeters,
-            }
-          : null
-      }
+      liveRoadSnap={amxLiveRoadSnap}
     />
   );
 
@@ -4833,15 +5087,15 @@ export default function App() {
   const cleanMapElement = (
     <VillageMap
       roads={roads}
-      houses={[]}
-      draftHouses={[]}
-      activeWalkSegments={[]}
-      draftJunctions={[]}
+      houses={EMPTY_HOUSES}
+      draftHouses={EMPTY_HOUSES}
+      activeWalkSegments={EMPTY_SEGMENTS}
+      draftJunctions={EMPTY_JUNCTIONS}
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
       routeResult={null}
-      alternativeRoutes={[]}
+      alternativeRoutes={EMPTY_ROUTES}
       liveProgress={null}
       targetHouse={null}
       darkMode={theme === 'dark'}
@@ -4849,14 +5103,12 @@ export default function App() {
       activeInstruction={null}
       distanceToNextTurnMeters={null}
       interactionMode="browse"
-      onMapClick={() => {}}
+      onMapClick={NOOP_MAP_CLICK}
       onNavigateHouse={startNavigateToHouse}
-      onCenterGps={() => handleFitAllRoadsOnly()}
+      onCenterGps={handleFitRoadsCenterGps}
       isFollowingGps={false}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
       focusTarget={focusTarget}
       hideHouses={true}
       hideGpsMarker={mapCleanScreen}
@@ -4868,15 +5120,15 @@ export default function App() {
   const vehiclesMapElement = (
     <VillageMap
       roads={roads}
-      houses={[]}
-      draftHouses={[]}
-      activeWalkSegments={[]}
-      draftJunctions={[]}
+      houses={EMPTY_HOUSES}
+      draftHouses={EMPTY_HOUSES}
+      activeWalkSegments={EMPTY_SEGMENTS}
+      draftJunctions={EMPTY_JUNCTIONS}
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
       routeResult={null}
-      alternativeRoutes={[]}
+      alternativeRoutes={EMPTY_ROUTES}
       liveProgress={null}
       targetHouse={null}
       darkMode={theme === 'dark'}
@@ -4884,15 +5136,13 @@ export default function App() {
       activeInstruction={null}
       distanceToNextTurnMeters={null}
       interactionMode="browse"
-      onMapClick={() => {}}
+      onMapClick={NOOP_MAP_CLICK}
       onNavigateHouse={startNavigateToHouse}
-      onCenterGps={() => handleFitAllRoadsOnly()}
+      onCenterGps={handleFitRoadsCenterGps}
       isFollowingGps={vehAutoFollow}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
-      onUserDrag={() => setVehAutoFollow(false)}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
+      onUserDrag={handleVehUserDrag}
       focusTarget={focusTarget}
       hideHouses={true}
       hideGpsMarker={true}
@@ -4905,14 +5155,14 @@ export default function App() {
     <VillageMap
       roads={roads}
       houses={houses}
-      draftHouses={[]}
-      activeWalkSegments={[]}
-      draftJunctions={[]}
+      draftHouses={EMPTY_HOUSES}
+      activeWalkSegments={EMPTY_SEGMENTS}
+      draftJunctions={EMPTY_JUNCTIONS}
       currentGps={userLocation}
       userHeadingDeg={userHeadingDeg}
       gpsQuality={gpsQuality}
       routeResult={null}
-      alternativeRoutes={[]}
+      alternativeRoutes={EMPTY_ROUTES}
       liveProgress={null}
       targetHouse={null}
       darkMode={theme === 'dark'}
@@ -4922,19 +5172,14 @@ export default function App() {
       activeInstruction={null}
       distanceToNextTurnMeters={null}
       interactionMode="browse"
-      onMapClick={() => {}}
+      onMapClick={NOOP_MAP_CLICK}
       onNavigateHouse={startNavigateToHouse}
       onSelectPendingBranch={handleSelectPendingBranch}
-      onCenterGps={() => handleLocateMe(true)}
+      onCenterGps={handleLocateCenterGps}
       isFollowingGps={isFollowingGps}
-      initialView={mapViewRef.current}
-      onViewChange={(view) => {
-        mapViewRef.current = view;
-      }}
-      onUserDrag={() => {
-        autoFollowGpsRef.current = false;
-        setIsFollowingGps(false);
-      }}
+      initialView={initialMapView}
+      onViewChange={handleMapViewChange}
+      onUserDrag={handleMapUserDrag}
       focusTarget={focusTarget}
       onSelectRoad={handleSelectSimStudioRoad}
       highlightedRoadId={simStudioRoadId}
@@ -5666,6 +5911,7 @@ export default function App() {
                 targetHouse={targetHouse}
                 routeResult={navRouteResult}
                 routeOptions={navRouteOptions}
+                isComputingRoute={isComputingOsmRoute}
                 selectedRouteIndex={safeSelectedRouteIndex}
                 onSelectRouteIndex={(idx) => {
                   setSelectedRouteIndex(idx);
@@ -5775,7 +6021,7 @@ export default function App() {
                     <Store className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-400 ml-2 shrink-0" />
                     <input
                       type="text"
-                      placeholder="House, Shop, Temple..."
+                      placeholder="House, Shop, City, Place..."
                       value={houseQuery}
                       onFocus={() => setHouseDropdownOpen(true)}
                       onBlur={() => setTimeout(() => setHouseDropdownOpen(false), 180)}
@@ -5789,56 +6035,111 @@ export default function App() {
                       type="submit"
                       className="px-2 sm:px-2.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold shrink-0 cursor-pointer"
                     >
-                      Track
+                      {isSearchingOsmPlaces ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        'Track'
+                      )}
                     </button>
                   </form>
 
-                  {houseDropdownOpen && matchingHouses.length > 0 && (
-                    <div className="absolute right-0 w-72 sm:w-80 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-lg divide-y divide-slate-100 dark:divide-slate-800 max-h-64 overflow-y-auto z-50">
-                      {matchingHouses.map((h) => {
-                        const pt = getEffectivePlaceType(h);
-                        const badgeLabel = getPlaceBadgeLabel(h);
-                        const badgeColor = getPlaceColor(pt, h.shopCategory, h.side);
-                        return (
-                          <button
-                            key={h.id}
-                            type="button"
-                            onMouseDown={() => startNavigateToHouse(h)}
-                            className="w-full px-3 py-2 text-left text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/60 flex items-center justify-between gap-2 cursor-pointer"
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <span
-                                style={{ backgroundColor: badgeColor }}
-                                className="w-6 h-6 rounded-md text-white flex items-center justify-center shrink-0"
-                              >
-                                <PlaceIcon
-                                  placeType={pt}
-                                  shopCategory={h.shopCategory}
-                                  shopName={h.shopName}
-                                  className="w-3.5 h-3.5"
-                                />
-                              </span>
-                              <div className="min-w-0">
-                                <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
-                                  {h.shopName?.trim() ||
-                                    (pt !== 'house' ? `${badgeLabel} #${h.houseNumber}` : `House ${h.houseNumber}`)}
-                                </div>
-                                <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                                  #{h.houseNumber} · {h.roadName}
+                  {houseDropdownOpen &&
+                    (matchingHouses.length > 0 ||
+                      osmPlaceResults.length > 0 ||
+                      isSearchingOsmPlaces) && (
+                      <div className="absolute right-0 w-72 sm:w-80 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-lg divide-y divide-slate-100 dark:divide-slate-800 max-h-72 overflow-y-auto z-50">
+                        {matchingHouses.map((h) => {
+                          const pt = getEffectivePlaceType(h);
+                          const badgeLabel = getPlaceBadgeLabel(h);
+                          const badgeColor = getPlaceColor(pt, h.shopCategory, h.side);
+                          return (
+                            <button
+                              key={h.id}
+                              type="button"
+                              onMouseDown={() => startNavigateToHouse(h)}
+                              className="w-full px-3 py-2 text-left text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/60 flex items-center justify-between gap-2 cursor-pointer"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span
+                                  style={{ backgroundColor: badgeColor }}
+                                  className="w-6 h-6 rounded-md text-white flex items-center justify-center shrink-0"
+                                >
+                                  <PlaceIcon
+                                    placeType={pt}
+                                    shopCategory={h.shopCategory}
+                                    shopName={h.shopName}
+                                    className="w-3.5 h-3.5"
+                                  />
+                                </span>
+                                <div className="min-w-0">
+                                  <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
+                                    {h.shopName?.trim() ||
+                                      (pt !== 'house'
+                                        ? `${badgeLabel} #${h.houseNumber}`
+                                        : `House ${h.houseNumber}`)}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                                    #{h.houseNumber} · {h.roadName}
+                                  </div>
                                 </div>
                               </div>
+                              <span
+                                style={{ backgroundColor: badgeColor }}
+                                className="px-1.5 py-0.5 rounded text-[9px] font-bold text-white shrink-0"
+                              >
+                                {badgeLabel}
+                              </span>
+                            </button>
+                          );
+                        })}
+
+                        {houseQuery.trim().length >= 3 && (
+                          <>
+                            <div className="px-3 py-1.5 bg-sky-50/80 dark:bg-sky-950/40 text-[10px] font-bold uppercase tracking-wider text-sky-800 dark:text-sky-300 flex items-center justify-between">
+                              <span>OpenStreetMap Cities &amp; Places</span>
+                              {isSearchingOsmPlaces && (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              )}
                             </div>
-                            <span
-                              style={{ backgroundColor: badgeColor }}
-                              className="px-1.5 py-0.5 rounded text-[9px] font-bold text-white shrink-0"
-                            >
-                              {badgeLabel}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
+                            {osmPlaceResults.map((item) => {
+                              const parts = item.display_name
+                                .split(',')
+                                .map((s) => s.trim())
+                                .filter(Boolean);
+                              const title = parts[0] || item.display_name;
+                              const sub = parts.slice(1, 4).join(', ');
+                              return (
+                                <button
+                                  key={`osm-${item.place_id}`}
+                                  type="button"
+                                  onMouseDown={() =>
+                                    startNavigateToHouse(buildOsmDestinationHouse(item))
+                                  }
+                                  className="w-full px-3 py-2 text-left text-xs hover:bg-sky-50 dark:hover:bg-sky-950/60 flex items-center justify-between gap-2 cursor-pointer"
+                                >
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <span className="w-6 h-6 rounded-md bg-sky-700 text-white flex items-center justify-center shrink-0">
+                                      <MapPin className="w-3.5 h-3.5" />
+                                    </span>
+                                    <div className="min-w-0">
+                                      <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
+                                        {title}
+                                      </div>
+                                      <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                                        {sub || 'OpenStreetMap Location'}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-sky-700 text-white shrink-0">
+                                    OSM
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </>
+                        )}
+                      </div>
+                    )}
                 </div>
               </div>
 
@@ -6062,6 +6363,7 @@ export default function App() {
                         targetHouse={targetHouse}
                         routeResult={navRouteResult}
                         routeOptions={navRouteOptions}
+                        isComputingRoute={isComputingOsmRoute}
                         selectedRouteIndex={safeSelectedRouteIndex}
                         onSelectRouteIndex={(idx) => {
                           setSelectedRouteIndex(idx);

@@ -71,6 +71,7 @@ interface NavigationPanelProps {
   targetHouse: VillageHouse | null;
   routeResult: VillageRouteResult | null;
   routeOptions: VillageRouteResult[];
+  isComputingRoute?: boolean;
   selectedRouteIndex: number;
   onSelectRouteIndex: (idx: number) => void;
   liveProgress?: LiveRouteProgress | null;
@@ -99,6 +100,7 @@ export default function NavigationPanel({
   targetHouse,
   routeResult,
   routeOptions,
+  isComputingRoute = false,
   selectedRouteIndex,
   onSelectRouteIndex,
   liveProgress = null,
@@ -287,10 +289,14 @@ export default function NavigationPanel({
                 </span>
               </div>
               <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
-                #{targetHouse.houseNumber} · {targetHouse.roadName} · {targetHouse.villageName}
+                {targetHouse.roadId === '__osm_external__'
+                  ? `${targetHouse.villageName} · OpenStreetMap Destination`
+                  : `#${targetHouse.houseNumber} · ${targetHouse.roadName} · ${targetHouse.villageName}`}
               </div>
               <div className="text-[11px] text-emerald-700 dark:text-emerald-400 font-medium mt-0.5">
-                {travelMode === 'car'
+                {routeResult?.isHybridOsmRoute
+                  ? `Hybrid Route: ${routeResult.hybridStageSummary || 'Village + OpenStreetMap'}`
+                  : travelMode === 'car'
                   ? 'Car mode: following saved car roads'
                   : `${travelMode === 'bike' ? 'Bike' : 'Walk'} mode: all village lanes open`}
               </div>
@@ -320,7 +326,16 @@ export default function NavigationPanel({
             </div>
           </div>
 
-          {!routeResult || !routeResult.reachable ? (
+          {isComputingRoute && (!routeResult || !routeResult.reachable) ? (
+            <div className="p-4 bg-sky-50 dark:bg-sky-950/50 border border-sky-200 dark:border-sky-800 rounded-xl space-y-1.5 text-xs text-sky-900 dark:text-sky-200">
+              <div className="font-semibold">
+                Connecting Village Exit + OpenStreetMap Road...
+              </div>
+              <div className="text-[11px] text-sky-700 dark:text-sky-300">
+                Finding local village road exit and highway route to destination.
+              </div>
+            </div>
+          ) : !routeResult || !routeResult.reachable ? (
             <div className="p-4 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl space-y-2.5 text-xs text-amber-900 dark:text-amber-200">
               <div className="font-semibold">
                 {routeResult?.reason || 'No connected village road reaches this house yet.'}
@@ -410,6 +425,14 @@ export default function NavigationPanel({
                     </span>
                   </div>
 
+                  {routeResult.isHybridOsmRoute && (
+                    <div className="flex items-center justify-between gap-2 text-[11px] pt-1 text-sky-300">
+                      <span className="font-semibold truncate">
+                        Village + OpenStreetMap: {routeResult.hybridStageSummary}
+                      </span>
+                    </div>
+                  )}
+
                   {liveProgress && (
                     <div className="flex items-center justify-between text-[11px] pt-1 text-slate-300">
                       <span
@@ -424,7 +447,9 @@ export default function NavigationPanel({
                         {liveProgress.movementStatus === 'away'
                           ? 'Moving away — Turn around'
                           : liveProgress.movementStatus === 'towards'
-                          ? `Moving toward House ${targetHouse.houseNumber}`
+                          ? targetHouse.roadId === '__osm_external__'
+                            ? `Moving toward ${targetHouse.shopName || targetHouse.villageName}`
+                            : `Moving toward House ${targetHouse.houseNumber}`
                           : 'Following saved road'}
                       </span>
                       <span className="font-mono tabular-nums">
@@ -501,6 +526,11 @@ export default function NavigationPanel({
                               )}
                             </span>
                           </div>
+                          {opt.isHybridOsmRoute && opt.hybridStageSummary && (
+                            <div className="text-[10px] font-semibold text-sky-700 dark:text-sky-300 truncate mt-0.5">
+                              {opt.hybridStageSummary}
+                            </div>
+                          )}
                           {opt.viaSummary && (
                             <div className="text-[11px] text-slate-600 dark:text-slate-400 truncate mt-0.5">
                               Via {opt.viaSummary}

@@ -128,6 +128,12 @@ export interface VillageRouteResult {
   carPartialStop?: boolean;
   carStopPoint?: { lat: number; lng: number };
   lastMileWalkMeters?: number;
+  isHybridOsmRoute?: boolean;
+  hybridStageSummary?: string;
+  hybridOriginRoadDistMeters?: number;
+  hybridOsmDistMeters?: number;
+  hybridDestRoadDistMeters?: number;
+  localGapMeters?: number;
   polyline: { lat: number; lng: number }[];
   instructions: NavigationInstruction[];
   reason?: string;
