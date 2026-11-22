@@ -1088,7 +1088,7 @@ export function findRoutesToHouse(
       foundPaths.every((prev) => {
         const prevEdges = new Set(prev.edgeSeq.map((e) => e.edgeId));
         const shared = res.edgeSeq.filter((e) => prevEdges.has(e.edgeId)).length;
-        const maxShared = Math.max(0, Math.min(res.edgeSeq.length - 1, Math.floor(res.edgeSeq.length * 0.92)));
+        const maxShared = Math.max(0, Math.min(res.edgeSeq.length - 1, Math.floor(res.edgeSeq.length * 0.95)));
         return shared <= maxShared || res.edgeSeq.length !== prev.edgeSeq.length;
       });
 
@@ -1131,7 +1131,7 @@ export function findRoutesToHouse(
     }
 
     // Also probe bypassing individual edges of the shortest path (sampled for speed)
-    const step = Math.max(1, Math.floor(primaryEdges.length / 8));
+    const step = Math.max(1, Math.floor(primaryEdges.length / 12));
     for (let i = 0; i < primaryEdges.length && foundPaths.length < maxRoutes; i += step) {
       const singleEdgePenalty = new Map<number, number>();
       singleEdgePenalty.set(primaryEdges[i].edgeId, 4);

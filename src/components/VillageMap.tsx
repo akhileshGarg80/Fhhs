@@ -425,24 +425,27 @@ function VillageMap({
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
-    const canvasRenderer = L.canvas({ padding: 0.85, tolerance: 8 });
+    const containerEl = containerRef.current;
+    const canvasRenderer = L.canvas({ padding: 0.3, tolerance: 6 });
 
-    const map = L.map(containerRef.current, {
+    const map = L.map(containerEl, {
       center: [initialViewRef.current.lat, initialViewRef.current.lng],
       zoom: initialViewRef.current.zoom,
       maxZoom: 20,
       zoomControl: false,
       preferCanvas: true,
       renderer: canvasRenderer,
-      zoomSnap: 0.25,
+      zoomSnap: 0,
       zoomDelta: 0.5,
-      wheelPxPerZoomLevel: 80,
-      wheelDebounceTime: 25,
+      scrollWheelZoom: false,
+      wheelDebounceTime: 40,
+      wheelPxPerZoomLevel: 60,
       inertia: true,
-      inertiaDeceleration: 2400,
+      inertiaDeceleration: 2100,
       inertiaMaxSpeed: 1800,
-      easeLinearity: 0.16,
+      easeLinearity: 0.14,
       zoomAnimation: true,
+      zoomAnimationThreshold: 8,
       fadeAnimation: true,
       markerZoomAnimation: true,
       bounceAtZoomLimits: false,
@@ -452,6 +455,153 @@ function VillageMap({
       shiftKeyRotate: true,
       rotateControl: false,
     });
+
+    // Prevent leaflet-rotate's pinch frame handler from firing moveend/zoomend & tile/canvas rebuilds on every touchmove frame
+    type LeafletInternalMap = L.Map & {
+      _animatingZoom?: boolean;
+      _animateToCenter?: L.LatLng;
+      _animateToZoom?: number;
+      _move: (center: L.LatLng, zoom?: number, data?: { pinch?: boolean; round?: boolean }, supressEvent?: boolean) => L.Map;
+      _moveEnd: (zoomChanged?: boolean) => L.Map;
+      _animateZoomNoDelay?: (center: L.LatLng, zoom: number) => void;
+      _stop: () => L.Map;
+      _mapPane?: HTMLElement;
+    };
+    const iMap = map as LeafletInternalMap;
+    let isZoomGestureActive = false;
+
+    if (typeof iMap._animateZoomNoDelay === 'function') {
+      iMap._animateZoomNoDelay = function (center: L.LatLng, zoom: number) {
+        if (!this._mapPane) return;
+        isZoomGestureActive = true;
+        this._animatingZoom = false;
+        this._animateToCenter = center;
+        this._animateToZoom = zoom;
+        this._move(center, zoom, { pinch: true, round: false }, true);
+        this.fire('zoomanim', { center, zoom, noUpdate: true });
+      };
+    }
+
+    // 60fps Smooth rAF Wheel / Trackpad Zoom (eliminates stock Leaflet's 250ms step-and-lock stutter)
+    let wheelRafId: number | null = null;
+    let wheelEndTimer: ReturnType<typeof setTimeout> | null = null;
+    let wheelZoomStartZoom = map.getZoom();
+    let wheelGoalZoom = map.getZoom();
+    let wheelCurrentZoom = map.getZoom();
+    let wheelCursorPt = L.point(containerEl.clientWidth / 2, containerEl.clientHeight / 2);
+    let wheelAnchorLatLng = map.getCenter();
+    let wheelMoved = false;
+
+    const finishWheelZoom = () => {
+      if (wheelRafId != null) {
+        cancelAnimationFrame(wheelRafId);
+        wheelRafId = null;
+      }
+      isZoomGestureActive = false;
+      if (wheelMoved && mapRef.current) {
+        wheelMoved = false;
+        const clamped = Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), wheelCurrentZoom));
+        const finalCenter = wheelAnchorLatLng;
+        const half = map.getSize().divideBy(2);
+        const targetOffset = wheelCursorPt.subtract(half);
+        const bearingRad = (map.getBearing() * Math.PI) / 180;
+        const unrotatedOffset =
+          bearingRad !== 0
+            ? L.point(
+                targetOffset.x * Math.cos(-bearingRad) - targetOffset.y * Math.sin(-bearingRad),
+                targetOffset.x * Math.sin(-bearingRad) + targetOffset.y * Math.cos(-bearingRad)
+              )
+            : targetOffset;
+        const anchorProj = map.project(finalCenter, clamped);
+        const nextCenter = map.unproject(anchorProj.subtract(unrotatedOffset), clamped);
+        iMap._move(nextCenter, clamped, undefined, false);
+        iMap._moveEnd(Math.abs(clamped - wheelZoomStartZoom) > 1e-4);
+      }
+    };
+
+    const stepWheelZoom = () => {
+      wheelRafId = null;
+      if (!mapRef.current) return;
+      const diff = wheelGoalZoom - wheelCurrentZoom;
+      if (Math.abs(diff) < 0.0025) {
+        wheelCurrentZoom = wheelGoalZoom;
+      } else {
+        wheelCurrentZoom += diff * 0.24;
+      }
+
+      const half = map.getSize().divideBy(2);
+      const offset = wheelCursorPt.subtract(half);
+      const bearingRad = (map.getBearing() * Math.PI) / 180;
+      const unrotated =
+        bearingRad !== 0
+          ? L.point(
+              offset.x * Math.cos(-bearingRad) - offset.y * Math.sin(-bearingRad),
+              offset.x * Math.sin(-bearingRad) + offset.y * Math.cos(-bearingRad)
+            )
+          : offset;
+
+      const anchorProj = map.project(wheelAnchorLatLng, wheelCurrentZoom);
+      const nextCenter = map.unproject(anchorProj.subtract(unrotated), wheelCurrentZoom);
+      iMap._move(nextCenter, wheelCurrentZoom, { pinch: true, round: false }, true);
+      map.fire('zoomanim', { center: nextCenter, zoom: wheelCurrentZoom, noUpdate: true });
+      wheelMoved = true;
+
+      if (Math.abs(wheelGoalZoom - wheelCurrentZoom) >= 0.0025) {
+        wheelRafId = requestAnimationFrame(stepWheelZoom);
+      } else {
+        if (wheelEndTimer) clearTimeout(wheelEndTimer);
+        wheelEndTimer = setTimeout(finishWheelZoom, 90);
+      }
+    };
+
+    const onWheelSmooth = (e: WheelEvent) => {
+      if (e.shiftKey) return; // Allow leaflet-rotate Shift+wheel rotation
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (!isZoomGestureActive) {
+        isZoomGestureActive = true;
+        iMap._stop();
+        wheelZoomStartZoom = map.getZoom();
+        wheelCurrentZoom = wheelZoomStartZoom;
+        wheelGoalZoom = wheelZoomStartZoom;
+        onUserDragRef.current?.();
+      }
+
+      const rect = containerEl.getBoundingClientRect();
+      wheelCursorPt = L.point(e.clientX - rect.left, e.clientY - rect.top);
+      wheelAnchorLatLng = map.containerPointToLatLng(wheelCursorPt);
+
+      let rawDelta = -e.deltaY;
+      if (e.deltaMode === 1) rawDelta *= 24;
+      else if (e.deltaMode === 2) rawDelta *= 120;
+      const zoomStep = Math.max(-0.85, Math.min(0.85, rawDelta / 220));
+      wheelGoalZoom = Math.max(
+        map.getMinZoom(),
+        Math.min(map.getMaxZoom(), wheelGoalZoom + zoomStep)
+      );
+
+      if (wheelEndTimer) clearTimeout(wheelEndTimer);
+      wheelEndTimer = setTimeout(finishWheelZoom, 140);
+      if (wheelRafId == null) {
+        wheelRafId = requestAnimationFrame(stepWheelZoom);
+      }
+    };
+
+    containerEl.addEventListener('wheel', onWheelSmooth, { passive: false });
+
+    const cancelFollowOnUserGesture = () => {
+      isProgrammaticMoveRef.current = false;
+      onUserDragRef.current?.();
+    };
+    const onTouchEndGesture = () => {
+      if (isZoomGestureActive && wheelRafId == null) {
+        isZoomGestureActive = false;
+      }
+    };
+    containerEl.addEventListener('pointerdown', cancelFollowOnUserGesture, { passive: true });
+    containerEl.addEventListener('touchstart', cancelFollowOnUserGesture, { passive: true });
+    containerEl.addEventListener('touchend', onTouchEndGesture, { passive: true });
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
     L.control.scale({ position: 'bottomleft', imperial: false }).addTo(map);
@@ -505,6 +655,7 @@ function VillageMap({
 
     const syncView = () => {
       isProgrammaticMoveRef.current = false;
+      if (isZoomGestureActive) return;
       const c = map.getCenter();
       const b = Math.round(((map.getBearing() % 360) + 360) % 360);
       setMapBearing((prev) => (prev === b ? prev : b));
@@ -523,7 +674,7 @@ function VillageMap({
         map.invalidateSize({ pan: false, debounceMoveend: true });
       });
     });
-    ro.observe(containerRef.current);
+    ro.observe(containerEl);
     const rafId = requestAnimationFrame(() => map.invalidateSize({ pan: false }));
     const settleTimer = setTimeout(() => map.invalidateSize({ pan: false }), 160);
 
@@ -531,11 +682,17 @@ function VillageMap({
 
     return () => {
       cancelAnimationFrame(rafId);
+      if (wheelRafId != null) cancelAnimationFrame(wheelRafId);
+      if (wheelEndTimer) clearTimeout(wheelEndTimer);
       if (rotateRafId != null) cancelAnimationFrame(rotateRafId);
       if (resizeRafId != null) cancelAnimationFrame(resizeRafId);
       if (gpsGlideRef.current?.rafId != null) cancelAnimationFrame(gpsGlideRef.current.rafId);
       if (simGlideRef.current?.rafId != null) cancelAnimationFrame(simGlideRef.current.rafId);
       if (vehGlideRef.current?.rafId != null) cancelAnimationFrame(vehGlideRef.current.rafId);
+      containerEl.removeEventListener('wheel', onWheelSmooth);
+      containerEl.removeEventListener('pointerdown', cancelFollowOnUserGesture);
+      containerEl.removeEventListener('touchstart', cancelFollowOnUserGesture);
+      containerEl.removeEventListener('touchend', onTouchEndGesture);
       clearTimeout(settleTimer);
       ro.disconnect();
       map.remove();
@@ -582,9 +739,9 @@ function VillageMap({
         attribution: cfg.attribution,
         maxZoom: cfg.maxZoom,
         maxNativeZoom,
-        keepBuffer: 6,
+        keepBuffer: 3,
         updateWhenZooming: false,
-        updateWhenIdle: false,
+        updateWhenIdle: true,
         detectRetina: false,
         ...(subdomains ? { subdomains } : {}),
       });
@@ -881,32 +1038,52 @@ function VillageMap({
   }, [isHandToolActive]);
 
   useEffect(() => {
-    if (!focusTarget || !mapRef.current) return;
-    isProgrammaticMoveRef.current = true;
+    const map = mapRef.current;
+    if (!focusTarget || !map) return;
+
+    let clearFlagTimer: ReturnType<typeof setTimeout> | null = null;
     if (focusTarget.boundsPoints && focusTarget.boundsPoints.length >= 2) {
+      isProgrammaticMoveRef.current = true;
       const bounds = L.latLngBounds(
         focusTarget.boundsPoints.map((p) => [p.lat, p.lng] as [number, number])
       );
-      mapRef.current.fitBounds(bounds, {
+      map.fitBounds(bounds, {
         padding: [56, 56],
         maxZoom: 19,
         animate: true,
         duration: 0.35,
       });
+      clearFlagTimer = setTimeout(() => {
+        isProgrammaticMoveRef.current = false;
+      }, 420);
     } else if (focusTarget.zoom != null) {
-      mapRef.current.setView([focusTarget.lat, focusTarget.lng], focusTarget.zoom, {
+      isProgrammaticMoveRef.current = true;
+      map.setView([focusTarget.lat, focusTarget.lng], focusTarget.zoom, {
         animate: true,
         duration: 0.3,
       });
+      clearFlagTimer = setTimeout(() => {
+        isProgrammaticMoveRef.current = false;
+      }, 360);
     } else {
-      // Smoothly glide camera without snapping zoom or interrupting movement
-      mapRef.current.panTo([focusTarget.lat, focusTarget.lng], {
-        animate: true,
-        duration: 0.32,
-        easeLinearity: 0.22,
-        noMoveStart: true,
-      });
+      const center = map.getCenter();
+      if (haversineMeters(center, { lat: focusTarget.lat, lng: focusTarget.lng }) > 2.5) {
+        isProgrammaticMoveRef.current = true;
+        map.panTo([focusTarget.lat, focusTarget.lng], {
+          animate: true,
+          duration: 0.32,
+          easeLinearity: 0.22,
+          noMoveStart: true,
+        });
+        clearFlagTimer = setTimeout(() => {
+          isProgrammaticMoveRef.current = false;
+        }, 380);
+      }
     }
+
+    return () => {
+      if (clearFlagTimer) clearTimeout(clearFlagTimer);
+    };
   }, [focusTarget]);
 
   // Smoothly align map with walking direction only when Heading-Up mode is explicitly enabled
@@ -1015,6 +1192,7 @@ function VillageMap({
             dashArray: st === 'no_car' ? '7 5' : undefined,
             lineCap: 'round',
             lineJoin: 'round',
+            smoothFactor: 1.5,
           });
           if (isVehicleSim && vehicleOverlay?.tool !== 'pencil') {
             segLine.on('click', (ev) => {
@@ -1060,7 +1238,7 @@ function VillageMap({
             isSelectedForEdit || isVehicleActiveRoad || isHighlighted
               ? 7
               : isMutedDuringTrack
-              ? 3.5
+              ? 4
               : 5,
           opacity:
             isSelectedForEdit || isVehicleActiveRoad || isHighlighted
@@ -1068,11 +1246,12 @@ function VillageMap({
               : isEditing
               ? 0.65
               : isMutedDuringTrack
-              ? 0.5
+              ? 0.68
               : 0.92,
           dashArray: isKachha ? '7 6' : undefined,
           lineCap: 'round',
           lineJoin: 'round',
+          smoothFactor: 1.5,
         });
         if (
           isEditing &&
@@ -2289,7 +2468,29 @@ function VillageMap({
         ? alternativeRoutes[0].totalDistanceMeters
         : routeResult.totalDistanceMeters;
 
-    const altPalette = ['#475569', '#7c3aed', '#0891b2', '#b45309', '#be185d'];
+    const altPalette = ['#7c3aed', '#0891b2', '#d97706', '#be185d', '#475569'];
+
+    // Pick the point along an alternate route that is farthest from the active route so labels never overlap
+    const findDivergentPoint = (altPts: { lat: number; lng: number }[]) => {
+      const refPts = routeResult.polyline;
+      const stride = Math.max(1, Math.floor(refPts.length / 25));
+      let bestPt = altPts[Math.floor(altPts.length / 2)];
+      let bestMinDist = -1;
+      const altStride = Math.max(1, Math.floor(altPts.length / 20));
+      for (let i = 1; i < altPts.length - 1; i += altStride) {
+        const p = altPts[i];
+        let minD = Infinity;
+        for (let j = 0; j < refPts.length; j += stride) {
+          const d = haversineMeters(p, refPts[j]);
+          if (d < minD) minD = d;
+        }
+        if (minD > bestMinDist) {
+          bestMinDist = minD;
+          bestPt = p;
+        }
+      }
+      return bestPt;
+    };
 
     for (let idx = 0; idx < alternativeRoutes.length; idx++) {
       const alt = alternativeRoutes[idx];
@@ -2297,24 +2498,30 @@ function VillageMap({
       const altLatLngs = alt.polyline.map((p) => [p.lat, p.lng] as [number, number]);
       const altColor = idx === 0 ? '#059669' : altPalette[(idx - 1) % altPalette.length];
       const extraM = Math.max(0, alt.totalDistanceMeters - shortestDist);
+      const viaShort = alt.viaSummary ? ` · ${alt.viaSummary.split('→')[0]?.trim().slice(0, 14)}` : '';
       const shortTag =
         idx === 0
-          ? `Shortest · ${formatDistance(alt.totalDistanceMeters)}`
+          ? `R1 · ${formatDistance(alt.totalDistanceMeters)}${viaShort}`
           : `R${idx + 1} · ${formatDistance(alt.totalDistanceMeters)}${
               extraM > 0 ? ` (+${formatDistance(extraM)})` : ''
-            }`;
+            }${viaShort}`;
 
       const altPoly = L.polyline(altLatLngs, {
         color: altColor,
-        weight: 4.5,
-        opacity: 0.72,
-        dashArray: '7 6',
+        weight: 5,
+        opacity: 0.82,
+        dashArray: '8 6',
         lineCap: 'round',
         lineJoin: 'round',
         smoothFactor: 1.4,
         interactive: true,
       })
-        .bindTooltip(`${shortTag} · Tap to select`, { sticky: true })
+        .bindTooltip(
+          `${idx === 0 ? 'Shortest' : `Route ${idx + 1}`}: ${formatDistance(alt.totalDistanceMeters)}${
+            alt.viaSummary ? ` · Via ${alt.viaSummary}` : ''
+          } · Tap to select`,
+          { sticky: true }
+        )
         .addTo(group);
 
       altPoly.on('click', (ev) => {
@@ -2322,18 +2529,20 @@ function VillageMap({
         onSelectRouteIndexRef.current?.(idx);
       });
 
-      const midIdx = Math.floor(alt.polyline.length / 2);
-      const midPt = alt.polyline[midIdx];
-      if (midPt) {
+      const badgePt = findDivergentPoint(alt.polyline);
+      if (badgePt) {
+        const badgeW = Math.min(180, Math.max(88, 22 + shortTag.length * 6.1));
         const badgeIcon = L.divIcon({
           className: 'grampath-alt-route-badge',
-          iconSize: [94, 22],
-          iconAnchor: [47, 11],
-          html: `<div style="height:22px;padding:0 7px;border-radius:6px;background:${
+          iconSize: [badgeW, 22],
+          iconAnchor: [Math.round(badgeW / 2), 11],
+          html: `<div style="max-width:180px;height:22px;padding:0 7px;border-radius:6px;background:${
             idx === 0 ? '#ecfdf5' : '#ffffff'
-          };color:${altColor};border:1.5px solid ${altColor};font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-shadow:0 2px 5px rgba(15,23,42,0.22);cursor:pointer;">${shortTag}</div>`,
+          };color:${altColor};border:1.5px solid ${altColor};font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 5px rgba(15,23,42,0.25);cursor:pointer;">${escapeHtml(
+            shortTag
+          )}</div>`,
         });
-        const badgeMarker = L.marker([midPt.lat, midPt.lng], {
+        const badgeMarker = L.marker([badgePt.lat, badgePt.lng], {
           icon: badgeIcon,
           zIndexOffset: 380,
         }).addTo(group);
@@ -2347,14 +2556,20 @@ function VillageMap({
     if ((startHouse || alternativeRoutes.length > 1) && routeResult.polyline.length >= 2) {
       const selMidPt = routeResult.polyline[Math.floor(routeResult.polyline.length / 2)];
       if (selMidPt) {
+        const activeVia = routeResult.viaSummary
+          ? ` · ${routeResult.viaSummary.split('→')[0]?.trim().slice(0, 16)}`
+          : '';
         const activeLabel = `${routeResult.routeLabel ?? 'Selected'} · ${formatDistance(
           routeResult.totalDistanceMeters
-        )}`;
+        )}${activeVia}`;
+        const activeW = Math.min(220, Math.max(124, 24 + activeLabel.length * 6.1));
         const selIcon = L.divIcon({
           className: 'grampath-active-route-badge',
-          iconSize: [148, 24],
-          iconAnchor: [74, 12],
-          html: `<div style="height:24px;padding:0 8px;border-radius:6px;background:#1d4ed8;color:#ffffff;border:2px solid #ffffff;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-shadow:0 2px 6px rgba(15,23,42,0.35);">${activeLabel}</div>`,
+          iconSize: [activeW, 24],
+          iconAnchor: [Math.round(activeW / 2), 12],
+          html: `<div style="max-width:220px;height:24px;padding:0 8px;border-radius:6px;background:#1d4ed8;color:#ffffff;border:2px solid #ffffff;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px rgba(15,23,42,0.35);">${escapeHtml(
+            activeLabel
+          )}</div>`,
         });
         L.marker([selMidPt.lat, selMidPt.lng], {
           icon: selIcon,

@@ -56,25 +56,23 @@
 
 .leaflet-map-pane,
 .leaflet-tile-pane,
-.leaflet-overlay-pane,
-.leaflet-marker-pane {
+.leaflet-overlay-pane {
   will-change: transform;
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
 }
 
 .leaflet-tile {
-  will-change: transform, opacity;
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
 }
 
 .leaflet-fade-anim .leaflet-tile {
-  transition: opacity 0.14s linear;
+  transition: opacity 0.12s linear;
 }
 
 .leaflet-zoom-anim .leaflet-zoom-animated {
-  transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
   will-change: transform;
 }
 
